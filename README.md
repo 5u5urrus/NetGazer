@@ -2,17 +2,19 @@ NetGazer is designed to efficiently capture screenshots of websites and web serv
 
 Finally you will have EyeWitness that works normally. :) Welcome NetGazer.
 
-**NetGazer: Web Server Screenshot Capturer**
+<h2>NetGazer: Web Server Screenshot Capturer</h2>
 
 **Overview**
 
 NetGazer is a Python tool designed for pentesters, security researchers, and anyone interested in cyber security field. It accepts hosts in a whole variety of formats - IP ranges, CIDR notations, URLs, fils and captures screenshots of their landing pages. These screenshots are then neatly organized into a Microsoft Word document or an HTML file, providing a visual inventory of web servers within the scanned range. 
 
 **EyeWtiness vs NetGazer**
+
+While EyeWitness is an amazing tool with multitudes of features, NetGazer in some areas is better.
 <ul style="list-style-type: '*';">
     <li>NetGazer works faster and more effective. If you submit the same IP range to EyeWitness and NetGazer, you will see NetGazer on average doing the job about 7-10 times faster.</li>
-    <li>NetGazer accepts targets in multiple and mixed formats that EyeWitness does not support.</li>
-    <li>Although EyeWitness has its strengths too in supporting nmap xml formats, which my tool does not (yet).</li>
+    <li>NetGazer automates the management of browser drivers, which is a significant advantage over EyeWitness that often breaks for those reasons. NetGazer feature ensures that: You always use the latest compatible version of the web driver for your browser, enhancing the reliability of screenshot captures. The tool abstracts away the complexity of manually downloading, setting up, and updating web drivers. </li>
+    <li>NetGazer accepts targets in multiple and mixed formats that EyeWitness does not support. Although EyeWitness has its strengths too in supporting nmap xml formats, which my tool does not (yet).</li>
     <li>NetGazer supports output in both html and word documents. EyeWitness does not support word document formats.</li>
     <li>NetGazer does not accumulate screenshots during capture, incorporating data directly into a single final docx or html files, hence presenting a cleaner job. EyeWitness creates a separate folder for all the images.</li>
 </ul>
