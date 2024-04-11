@@ -8,14 +8,11 @@ import argparse
 import ipaddress
 from itertools import product
 
-# Create the parser
 parser = argparse.ArgumentParser(description='Scan and capture web server screenshots.')
 
-# Add arguments
 parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range')
 parser.add_argument('output_file', help='Output file name (.docx or .html)')
 
-# Parse arguments
 args = parser.parse_args()
 
 def initialChecks():
@@ -149,7 +146,7 @@ def summonSteeds():
     
     #instantiate the Firefox WebDriver with the updated arguments
     driver = webdriver.Firefox(service=service, options=options)
-    
+    driver.set_page_load_timeout(30)
     return driver
 #    return webdriver.Firefox(executable_path=GeckoDriverManager().install(), firefox_options=options)
 
@@ -173,7 +170,7 @@ def captureVisionsHTML(driver, output_file):
                 else:
                     print(f"Failed to save screenshot for {url}")
             except Exception as e:
-                print(f"Failed to capture {url}: {e}")
+                pass #print(f"Failed to capture {url}: {e}")
 
     with open(output_file, 'w') as file:
         file.write("<html><head><title>Web Server Screenshots</title></head><body>")
@@ -217,11 +214,11 @@ def captureVisions(driver, output_file):
                 try:
                     os.remove(screenshot_path)
                 except FileNotFoundError as e:
-                    print(f"Could not delete screenshot {screenshot_path}: {e}")
+                    pass #print(f"Could not delete screenshot {screenshot_path}: {e}")
 
                 whisperWinds(f"Successfully captured {url}")
             except Exception as e:
-                print(f"Failed to capture {url}: {e}")
+                pass #print(f"Failed to capture {url}: {e}")
     
     doc.save(output_file)
 
