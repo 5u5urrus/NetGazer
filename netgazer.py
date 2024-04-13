@@ -1,4 +1,4 @@
-#Scan for web servers, capture their screens and place them in a word document table (docx)
+#Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
 #Author: Vahe Demirkhanyan
 import base64
 import os
@@ -14,6 +14,7 @@ parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range'
 parser.add_argument('output_file', help='Output file name (.docx or .html)')
 
 args = parser.parse_args()
+
 
 def initialChecks():
     # Check for root permissions
@@ -40,50 +41,39 @@ def is_ip_range(ip_range):
 
 def generateIpsFromComplexRange(range_str):
     octet_parts = range_str.split('.')
-    octet_ranges = []
-
-    for part in octet_parts:
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            octet_ranges.append(range(start, end + 1))
-        else:
-            octet_ranges.append([int(part)])
-
+    octet_ranges = [range(int(part.split('-')[0]), int(part.split('-')[1]) + 1) if '-' in part else [int(part)] for part in octet_parts]
     return ['.'.join(map(str, combination)) for combination in product(*octet_ranges)]
 
+
 def expandIPRange_or_singleIP(input_value):
-    if '-' in input_value:
-        return expandIPRange(input_value)
-    else:
-        return [input_value]
+    return expandIPrange(input_value) if '-' in input_value else [input_value]
 
 def expandIPRange(ip_range):
-    if '-' in ip_range:
-        start_ip, end_ip = ip_range.split('-')
-        # Check if shorthand notation is used (e.g., "8.8.8.1-254")
-        if not '.' in end_ip:
-            start_ip_base = '.'.join(start_ip.split('.')[:-1])
-            end_ip = f"{start_ip_base}.{end_ip}"
-        
-        start = ipaddress.IPv4Address(start_ip)
-        end = ipaddress.IPv4Address(end_ip)
-        return [str(ip) for ip in range(int(start), int(end) + 1)]
-    else:
-        # In case the input is directly a single IP, not a range
-        return [ip_range]
+    start_ip, end_ip = ip_range.split('-')
+    if '.' not in end_ip:
+        start_ip_base = '.'.join(start_ip.split('.')[:-1])
+        end_ip = f"{start_ip_base}.{end_ip}"
+    start = ipaddress.IPv4Address(start_ip)
+    end = ipaddress.IPv4Address(end_ip)
+    return [str(ip) for ip in range(int(start), int(end) + 1)]
 
 def handleInput(input_value):
-    # CIDR notation
     if '/' in input_value:
-        return [str(ip) for ip in ipaddress.ip_network(input_value, strict=False).hosts()]
+        # Handle CIDR notation more robustly, including error handling
+        try:
+            return [str(ip) for ip in ipaddress.ip_network(input_value, strict=False).hosts()]
+        except ValueError as e:
+            print(f"Error parsing CIDR notation '{input_value}': {e}")
+            return []
 
-    # Complex IP range (e.g., "8.8.8-9.1-3")
-    elif '-' in input_value and input_value.count('.') == 3 and input_value.count('-') >= 1:
-        return generateIpsFromComplexRange(input_value)
+    elif '-' in input_value and input_value.count('.') == 3:
+        # Simplified decision tree for handling complex ranges directly
+        return generateIpsFromComplexRange(input_value) if input_value.count('-') >= 1 else expandIPRange_or_singleIP(input_value)
 
-    # Simple IP range (e.g., "8.8.8.1-254") or single IP
     else:
+        # Default case handles single IPs or unexpected formats gracefully
         return expandIPRange_or_singleIP(input_value)
+
 
 def gatherTomes():
     required_libraries = ['selenium', 'docx', 'webdriver_manager', 'ipaddress']
@@ -150,6 +140,26 @@ def summonSteeds():
     return driver
 #    return webdriver.Firefox(executable_path=GeckoDriverManager().install(), firefox_options=options)
 
+def capture_screenshot(driver, url, screenshot_path):
+    try:
+        driver.get(url)
+        if driver.save_screenshot(screenshot_path):
+            return True
+        else:
+            print(f"Failed to save screenshot for {url}")
+            return False
+    except Exception as e:
+        #print(f"Failed to capture {url}: {e}")
+        return False
+
+def encodeImageBase64(screenshot_path):
+    try:
+        with open(screenshot_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Failed to read or encode the file {screenshot_path}: {e}")
+        return None
+
 def captureVisionsHTML(driver, output_file):
     items = []
     temp_files_to_delete = []  # List to keep track of temporary screenshot file paths
@@ -159,37 +169,41 @@ def captureVisionsHTML(driver, output_file):
             url = f"{scheme}://{host}"
             screenshot_filename = f'temp_screenshot_{host.replace(".", "_")}.png'
             screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
-            try:
-                driver.get(url)
-                if driver.save_screenshot(screenshot_path):
-                    with open(screenshot_path, "rb") as image_file:
-                        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-                    items.append((url, f"data:image/png;base64,{base64_image}"))
-                    temp_files_to_delete.append(screenshot_path)  # Add path to list for later deletion
-                    whisperWinds(f"Successfully captured {url}")
-                else:
-                    print(f"Failed to save screenshot for {url}")
-            except Exception as e:
-                pass #print(f"Failed to capture {url}: {e}")
+            if capture_screenshot(driver, url, screenshot_path):
+                items.append((url, screenshot_path))
+                temp_files_to_delete.append(screenshot_path)
+                whisperWinds(f"Successfully captured {url}")
+
+    html_content = ["<html><head><title>Web Server Screenshots</title></head><body>",
+                    "<h1>Web Server Screenshots</h1>",
+                    "<table border='1'>",
+                    "<tr><th>Web Request Info</th><th>Web Screenshot</th></tr>"]
+    
+    for url, screenshot_path in items:
+        try:
+            with open(screenshot_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            html_content.append(f"<tr><td>{url}</td><td><img src='data:image/png;base64,{base64_image}' width='350'></td></tr>")
+        except IOError as e:
+            print(f"Error reading screenshot file {screenshot_path}: {e}")
+
+    html_content.append("</table></body></html>")
 
     with open(output_file, 'w') as file:
-        file.write("<html><head><title>Web Server Screenshots</title></head><body>")
-        file.write("<h1>Web Server Screenshots</h1>")
-        file.write("<table border='1'>")
-        file.write("<tr><th>Web Request Info</th><th>Web Screenshot</th></tr>")
-        
-        for url, base64_image in items:
-            file.write(f"<tr><td>{url}</td><td><img src='{base64_image}' width='350'></td></tr>")
-        
-        file.write("</table>")
-        file.write("</body></html>")
+        file.writelines(html_content)
 
-    # Now delete the temporary screenshot files
-    for file_path in temp_files_to_delete:
-        try:
-            os.remove(file_path)
-        except Exception as e:
-            pass #print(f"Error deleting temporary file {file_path}: {e}")
+    clean_up_files(temp_files_to_delete)  # Utilize a helper function to clean up files
+
+def clean_up_files(file_paths):
+    for file_path in file_paths:
+        if os.path.exists(file_path):  # Check if the file exists before trying to delete it
+            try:
+                os.remove(file_path)
+                #print(f"Successfully deleted {file_path}")
+            except Exception as e:
+                pass #print(f"Error deleting temporary file {file_path}: {e}")
+        else:
+            pass #print(f"File not found, could not delete: {file_path}")
 
 def captureVisions(driver, output_file):
     doc = docx.Document()
@@ -201,25 +215,16 @@ def captureVisions(driver, output_file):
     for host, schemes in hosts_to_capture:
         for scheme in schemes:
             url = f"{scheme}://{host}"
-            try:
-                driver.get(url)
-                screenshot_path = 'temp_screenshot.png'
-                driver.save_screenshot(screenshot_path)
+            screenshot_path = 'temp_screenshot.png'
+            if capture_screenshot(driver, url, screenshot_path):
                 row_cells = table.add_row().cells
                 row_cells[0].text = url
                 paragraph = row_cells[1].paragraphs[0]
                 run = paragraph.add_run()
                 run.add_picture(screenshot_path, width=Inches(3.5))
                 os.remove(screenshot_path)
-                try:
-                    os.remove(screenshot_path)
-                except FileNotFoundError as e:
-                    pass #print(f"Could not delete screenshot {screenshot_path}: {e}")
-
                 whisperWinds(f"Successfully captured {url}")
-            except Exception as e:
-                pass #print(f"Failed to capture {url}: {e}")
-    
+
     doc.save(output_file)
 
 def unravelScrolls(hosts):
