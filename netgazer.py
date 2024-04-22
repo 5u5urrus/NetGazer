@@ -7,6 +7,8 @@ import tempfile
 import argparse
 import ipaddress
 from itertools import product
+import asyncio
+import aiohttp
 
 parser = argparse.ArgumentParser(description='Scan and capture web server screenshots.')
 
@@ -14,6 +16,11 @@ parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range'
 parser.add_argument('output_file', help='Output file name (.docx or .html)')
 
 args = parser.parse_args()
+
+async def save_docx_async(document, path):
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor() as pool:
+        await loop.run_in_executor(pool, document.save, path)
 
 
 def initialChecks():
@@ -96,7 +103,9 @@ gatherTomes()
 
 # The rest of imports and script
 import socket
-from concurrent.futures import ThreadPoolExecutor
+#from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
@@ -106,44 +115,75 @@ from webdriver_manager.firefox import GeckoDriverManager
 import docx
 from docx.shared import Inches
 
+executor = ThreadPoolExecutor(max_workers=50)  # Adjust the number of workers based on your needs
+
+async def capture_screenshot_async(driver, url, screenshot_path):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, capture_screenshot, driver, url, screenshot_path)
+
+def capture_screenshot_concurrent(driver, host_scheme):
+    host, scheme = host_scheme
+    url = f"{scheme}://{host}"
+    screenshot_filename = f'temp_screenshot_{host.replace(".", "_")}.png'
+    screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
+    if capture_screenshot(driver, url, screenshot_path):
+        whisperWinds(f"Successfully captured {url}")
+        return url, screenshot_path
+    return None
+
 def whisperWinds(text):
     print(f"\033[92m{text}\033[0m")
 
-def peekPortals(host, port, timeout=10):
+async def peekPortals(host, port, timeout=10):
+    # Determine the correct protocol based on the port
+    protocol = 'https' if port == 443 else 'http'
+    url = f"{protocol}://{host}:{port}"
+
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            print(f"Port {port} is open on {host}")
-            return True
-    except Exception:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status:
+                    print(f"Port {port} is open on {host}, received HTTP status: {response.status}")
+                    return True
+                else:
+                    # This branch might never be executed as non-2XX responses still have status codes
+                    return False
+    except Exception as e:
         return False
 
 hosts_to_capture = []
 
-def scoutLands(host):
+async def scoutLands(host):
     schemes = []
-    if peekPortals(host, 443):
+    if await peekPortals(host, 443):  # Using await here
         schemes.append('https')
-    if peekPortals(host, 80):
+    if await peekPortals(host, 80):  # And here
         schemes.append('http')
     if schemes:
         hosts_to_capture.append((host, schemes))
 
 def summonSteeds():
     options = Options()
-    options.headless = True
+    #options.headless = True
+    #options.page_load_strategy = 'eager'
     options.add_argument("--headless")
-    service = FirefoxService(executable_path=GeckoDriverManager().install())
+
+    # Check if the GeckoDriver is already downloaded and use the existing path, otherwise install it
+    driver_path = GeckoDriverManager().install()
     
-    #instantiate the Firefox WebDriver with the updated arguments
+    service = FirefoxService(executable_path=driver_path)
+    
+    # instantiate the Firefox WebDriver with the updated arguments
     driver = webdriver.Firefox(service=service, options=options)
     driver.set_page_load_timeout(30)
     return driver
-#    return webdriver.Firefox(executable_path=GeckoDriverManager().install(), firefox_options=options)
+
 
 def capture_screenshot(driver, url, screenshot_path):
     try:
         driver.get(url)
         if driver.save_screenshot(screenshot_path):
+            whisperWinds(f"Successfully captured {url}")
             return True
         else:
             print(f"Failed to save screenshot for {url}")
@@ -151,6 +191,46 @@ def capture_screenshot(driver, url, screenshot_path):
     except Exception as e:
         #print(f"Failed to capture {url}: {e}")
         return False
+
+async def captureVisionsHTMLAsync(driver, output_file):
+    tasks = []
+    temp_files_to_delete = []
+    for host, schemes in hosts_to_capture:
+        for scheme in schemes:
+            url = f"{scheme}://{host}"
+            screenshot_filename = f'temp_screenshot_{host.replace(".", "_")}.png'
+            screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
+            # Create the coroutine for the screenshot and store it along with URL and path
+            task = asyncio.create_task(capture_screenshot_async(driver, url, screenshot_path))
+            tasks.append((task, url, screenshot_path))  # Store task with its metadata
+            temp_files_to_delete.append(screenshot_path)
+
+    # Wait for all tasks to complete
+    results = await asyncio.gather(*[t[0] for t in tasks])  # Only gather the task part
+
+    # Prepare the HTML content
+    html_content = ["<html><head><title>Web Server Screenshots</title></head><body>",
+                    "<h1>Web Server Screenshots</h1>",
+                    "<table border='1'>",
+                    "<tr><th>Web Request Info</th><th>Web Screenshot</th></tr>"]
+
+    # Process results and corresponding metadata
+    for result, (_, url, screenshot_path) in zip(results, tasks):  # Correctly access stored URL and path
+        if result:
+            try:
+                with open(screenshot_path, "rb") as image_file:
+                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+                html_content.append(f"<tr><td>{url}</td><td><img src='data:image/png;base64,{base64_image}' width='350'></td></tr>")
+            except IOError as e:
+                print(f"Error reading screenshot file {screenshot_path}: {e}")
+
+    html_content.append("</table></body></html>")
+
+    # Write to the output file
+    with open(output_file, 'w') as file:
+        file.writelines(html_content)
+
+    clean_up_files(temp_files_to_delete)
 
 def encodeImageBase64(screenshot_path):
     try:
@@ -161,24 +241,26 @@ def encodeImageBase64(screenshot_path):
         return None
 
 def captureVisionsHTML(driver, output_file):
-    items = []
-    temp_files_to_delete = []  # List to keep track of temporary screenshot file paths
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        # Submit screenshot capture tasks
+        future_to_url = {executor.submit(capture_screenshot_concurrent, driver, (host, scheme)): (host, scheme)
+                         for host, schemes in hosts_to_capture for scheme in schemes}
 
-    for host, schemes in hosts_to_capture:
-        for scheme in schemes:
-            url = f"{scheme}://{host}"
-            screenshot_filename = f'temp_screenshot_{host.replace(".", "_")}.png'
-            screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
-            if capture_screenshot(driver, url, screenshot_path):
+        items = []
+        temp_files_to_delete = []
+
+        for future in as_completed(future_to_url):
+            result = future.result()
+            if result:
+                url, screenshot_path = result
                 items.append((url, screenshot_path))
                 temp_files_to_delete.append(screenshot_path)
-                whisperWinds(f"Successfully captured {url}")
 
     html_content = ["<html><head><title>Web Server Screenshots</title></head><body>",
                     "<h1>Web Server Screenshots</h1>",
                     "<table border='1'>",
                     "<tr><th>Web Request Info</th><th>Web Screenshot</th></tr>"]
-    
+
     for url, screenshot_path in items:
         try:
             with open(screenshot_path, "rb") as image_file:
@@ -192,7 +274,7 @@ def captureVisionsHTML(driver, output_file):
     with open(output_file, 'w') as file:
         file.writelines(html_content)
 
-    clean_up_files(temp_files_to_delete)  # Utilize a helper function to clean up files
+    clean_up_files(temp_files_to_delete)  # Clean up files
 
 def clean_up_files(file_paths):
     for file_path in file_paths:
@@ -205,27 +287,38 @@ def clean_up_files(file_paths):
         else:
             pass #print(f"File not found, could not delete: {file_path}")
 
-def captureVisions(driver, output_file):
+async def captureVisions(driver, output_file):
     doc = docx.Document()
     table = doc.add_table(rows=1, cols=2)
     hdr_cells = table.rows[0].cells
     hdr_cells[0].text = 'Web Request Info'
     hdr_cells[1].text = 'Web Screenshot'
-    
+
+    tasks = []
     for host, schemes in hosts_to_capture:
         for scheme in schemes:
             url = f"{scheme}://{host}"
-            screenshot_path = 'temp_screenshot.png'
-            if capture_screenshot(driver, url, screenshot_path):
-                row_cells = table.add_row().cells
-                row_cells[0].text = url
-                paragraph = row_cells[1].paragraphs[0]
-                run = paragraph.add_run()
-                run.add_picture(screenshot_path, width=Inches(3.5))
-                os.remove(screenshot_path)
-                whisperWinds(f"Successfully captured {url}")
+            #screenshot_path = 'temp_screenshot.png'
+            #screenshot_path = f'temp_screenshot_{host.replace('.', '_')}_{scheme}.png'
+            replaced_host = host.replace('.', '_')
+            screenshot_path = f'temp_screenshot_{replaced_host}_{scheme}.png'
+            task = asyncio.create_task(capture_screenshot_async(driver, url, screenshot_path))
+            tasks.append((task, url, screenshot_path, table))
 
-    doc.save(output_file)
+    results = await asyncio.gather(*[t[0] for t in tasks])
+
+    for result, (task, url, screenshot_path, table) in zip(results, tasks):
+        if result:
+            row_cells = table.add_row().cells
+            row_cells[0].text = url
+            paragraph = row_cells[1].paragraphs[0]
+            run = paragraph.add_run()
+            run.add_picture(screenshot_path, width=Inches(3.5))
+            os.remove(screenshot_path)
+            whisperWinds(f"Successfully captured {url}")
+
+    await save_docx_async(doc, output_file)
+
 
 def unravelScrolls(hosts):
     expanded_hosts = []
@@ -238,10 +331,16 @@ def unravelScrolls(hosts):
             expanded_hosts.append(host)
     return expanded_hosts
 
+
+async def perform_port_scans(hosts):
+    print(f"Preparing to scan {len(hosts)} hosts...")  # How many hosts are being scanned
+    tasks = [scoutLands(host) for host in hosts]
+    await asyncio.gather(*tasks)
+    print("All hosts have been scanned.")  # Confirmation that all tasks were awaited
+
+
 def embarkQuest(input_value, output_file):
-    # Determine if input is a file or direct IP/CIDR/range input
     try:
-        # Attempt to treat the input as a file path
         with open(input_value, 'r') as file:
             hosts = [host.strip() for host in file if host.strip()]
     except IOError:
@@ -251,18 +350,16 @@ def embarkQuest(input_value, output_file):
     expanded_hosts = unravelScrolls(hosts)
 
     print("Starting port scan...")
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        executor.map(scoutLands, expanded_hosts)
-
+    asyncio.run(perform_port_scans(expanded_hosts))  # Use asyncio.run to run the async port scan
     print("Port scan finished. Beginning screen capture...")
 
     driver = summonSteeds()
 
     # Determine output format and call appropriate function
     if output_file.endswith('.docx'):
-        captureVisions(driver, output_file)
+        asyncio.run(captureVisions(driver, output_file))
     elif output_file.endswith('.html'):
-        captureVisionsHTML(driver, output_file)
+        asyncio.run(captureVisionsHTMLAsync(driver, output_file))  # Already async
     else:
         print("Unsupported file format. Please use .docx or .html.")
         driver.quit()
@@ -275,4 +372,5 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python netgazer.py <hosts_file> <output_file>")
     else:
+        print(f"Starting the script for {sys.argv[1]} outputting to {sys.argv[2]}")
         embarkQuest(sys.argv[1], sys.argv[2])
