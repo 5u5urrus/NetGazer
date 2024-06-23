@@ -51,4 +51,9 @@ Command running:<br>
 Resulting word document:<br> 
 <img width="694" alt="docx" src="https://github.com/5u5urrus/NetGazer/assets/165041037/072e5fa0-83eb-47b3-8759-de3abb47c856">
 
+**Example 3: python netgazer.py 1.1.1.1-255 output.docx** <br>
+Command running:<br>
+<img width="542" alt="Screenshot 2024-06-23 030350" src="https://github.com/5u5urrus/NetGazer/assets/165041037/e89b402a-6106-49d7-b260-b0255eb433ed">
+
+
 
