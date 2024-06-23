@@ -1,5 +1,5 @@
-#Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
-#Author: Vahe Demirkhanyan
+# Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
+# Author: Vahe Demirkhanyan
 import base64
 import os
 import sys
@@ -7,6 +7,17 @@ import tempfile
 import argparse
 import ipaddress
 from itertools import product
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+
+import socket
+from selenium import webdriver
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.firefox.options import Options
+from webdriver_manager.firefox import GeckoDriverManager
+
+import docx
+from docx.shared import Inches
 
 parser = argparse.ArgumentParser(description='Scan and capture web server screenshots.')
 
@@ -14,7 +25,6 @@ parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range'
 parser.add_argument('output_file', help='Output file name (.docx or .html)')
 
 args = parser.parse_args()
-
 
 def initialChecks():
     # Check for root permissions
@@ -43,7 +53,6 @@ def generateIpsFromComplexRange(range_str):
     octet_parts = range_str.split('.')
     octet_ranges = [range(int(part.split('-')[0]), int(part.split('-')[1]) + 1) if '-' in part else [int(part)] for part in octet_parts]
     return ['.'.join(map(str, combination)) for combination in product(*octet_ranges)]
-
 
 def expandIPRange_or_singleIP(input_value):
     return expandIPrange(input_value) if '-' in input_value else [input_value]
@@ -74,9 +83,8 @@ def handleInput(input_value):
         # Default case handles single IPs or unexpected formats gracefully
         return expandIPRange_or_singleIP(input_value)
 
-
 def gatherTomes():
-    required_libraries = ['selenium', 'docx', 'webdriver_manager', 'ipaddress']
+    required_libraries = ['selenium', 'docx', 'webdriver_manager', 'ipaddress', 'tqdm']
     missing_libraries = []
 
     for library in required_libraries:
@@ -94,32 +102,20 @@ def gatherTomes():
 # Checking if libraries are present
 gatherTomes()
 
-# The rest of imports and script
-import socket
-from concurrent.futures import ThreadPoolExecutor
-
-from selenium import webdriver
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.firefox.options import Options
-from webdriver_manager.firefox import GeckoDriverManager
-
-import docx
-from docx.shared import Inches
-
 def whisperWinds(text):
-    print(f"\033[92m{text}\033[0m")
+    tqdm.write(f"\033[92m{text}\033[0m")
 
 def peekPortals(host, port, timeout=10):
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            print(f"Port {port} is open on {host}")
+            tqdm.write(f"Port {port} is open on {host}")
             return True
     except Exception:
         return False
 
 hosts_to_capture = []
 
-def scoutLands(host):
+def scoutLands(host, progress_bar):
     schemes = []
     if peekPortals(host, 443):
         schemes.append('https')
@@ -127,6 +123,7 @@ def scoutLands(host):
         schemes.append('http')
     if schemes:
         hosts_to_capture.append((host, schemes))
+    progress_bar.update(1)
 
 def summonSteeds():
     options = Options()
@@ -138,7 +135,6 @@ def summonSteeds():
     driver = webdriver.Firefox(service=service, options=options)
     driver.set_page_load_timeout(30)
     return driver
-#    return webdriver.Firefox(executable_path=GeckoDriverManager().install(), firefox_options=options)
 
 def capture_screenshot(driver, url, screenshot_path):
     try:
@@ -146,10 +142,9 @@ def capture_screenshot(driver, url, screenshot_path):
         if driver.save_screenshot(screenshot_path):
             return True
         else:
-            print(f"Failed to save screenshot for {url}")
+            tqdm.write(f"Failed to save screenshot for {url}")
             return False
     except Exception as e:
-        #print(f"Failed to capture {url}: {e}")
         return False
 
 def encodeImageBase64(screenshot_path):
@@ -157,10 +152,10 @@ def encodeImageBase64(screenshot_path):
         with open(screenshot_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
     except Exception as e:
-        print(f"Failed to read or encode the file {screenshot_path}: {e}")
+        tqdm.write(f"Failed to read or encode the file {screenshot_path}: {e}")
         return None
 
-def captureVisionsHTML(driver, output_file):
+def captureVisionsHTML(driver, output_file, progress_bar):
     items = []
     temp_files_to_delete = []  # List to keep track of temporary screenshot file paths
 
@@ -173,6 +168,7 @@ def captureVisionsHTML(driver, output_file):
                 items.append((url, screenshot_path))
                 temp_files_to_delete.append(screenshot_path)
                 whisperWinds(f"Successfully captured {url}")
+        progress_bar.update(1)
 
     html_content = ["<html><head><title>Web Server Screenshots</title></head><body>",
                     "<h1>Web Server Screenshots</h1>",
@@ -185,7 +181,7 @@ def captureVisionsHTML(driver, output_file):
                 base64_image = base64.b64encode(image_file.read()).decode('utf-8')
             html_content.append(f"<tr><td>{url}</td><td><img src='data:image/png;base64,{base64_image}' width='350'></td></tr>")
         except IOError as e:
-            print(f"Error reading screenshot file {screenshot_path}: {e}")
+            tqdm.write(f"Error reading screenshot file {screenshot_path}: {e}")
 
     html_content.append("</table></body></html>")
 
@@ -199,13 +195,12 @@ def clean_up_files(file_paths):
         if os.path.exists(file_path):  # Check if the file exists before trying to delete it
             try:
                 os.remove(file_path)
-                #print(f"Successfully deleted {file_path}")
             except Exception as e:
-                pass #print(f"Error deleting temporary file {file_path}: {e}")
+                pass
         else:
-            pass #print(f"File not found, could not delete: {file_path}")
+            pass
 
-def captureVisions(driver, output_file):
+def captureVisions(driver, output_file, progress_bar):
     doc = docx.Document()
     table = doc.add_table(rows=1, cols=2)
     hdr_cells = table.rows[0].cells
@@ -224,6 +219,7 @@ def captureVisions(driver, output_file):
                 run.add_picture(screenshot_path, width=Inches(3.5))
                 os.remove(screenshot_path)
                 whisperWinds(f"Successfully captured {url}")
+        progress_bar.update(1)
 
     doc.save(output_file)
 
@@ -251,23 +247,30 @@ def embarkQuest(input_value, output_file):
     expanded_hosts = unravelScrolls(hosts)
 
     print("Starting port scan...")
+    progress_bar = tqdm(total=len(expanded_hosts), unit='host', desc="Port scanning", leave=False)
     with ThreadPoolExecutor(max_workers=30) as executor:
-        executor.map(scoutLands, expanded_hosts)
+        futures = [executor.submit(scoutLands, host, progress_bar) for host in expanded_hosts]
+        for future in futures:
+            future.result()
+    progress_bar.close()
+    print("Port scan finished.")
 
-    print("Port scan finished. Beginning screen capture...")
+    print("Beginning screen capture...")
+    progress_bar = tqdm(total=len(hosts_to_capture), unit='host', desc="Screen capturing", leave=False)
 
     driver = summonSteeds()
 
     # Determine output format and call appropriate function
     if output_file.endswith('.docx'):
-        captureVisions(driver, output_file)
+        captureVisions(driver, output_file, progress_bar)
     elif output_file.endswith('.html'):
-        captureVisionsHTML(driver, output_file)
+        captureVisionsHTML(driver, output_file, progress_bar)
     else:
         print("Unsupported file format. Please use .docx or .html.")
         driver.quit()
         sys.exit(1)
 
+    progress_bar.close()
     print("Screen capture finished.")
     driver.quit()
 
