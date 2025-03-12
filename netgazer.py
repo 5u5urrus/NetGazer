@@ -1,111 +1,137 @@
 # Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
 # Author: Vahe Demirkhanyan
+#!/usr/bin/env python3
 import base64
 import os
 import sys
-import tempfile
 import argparse
 import ipaddress
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-
 import socket
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options
 from webdriver_manager.firefox import GeckoDriverManager
-
 import docx
 from docx.shared import Inches
+from io import BytesIO
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 parser = argparse.ArgumentParser(description='Scan and capture web server screenshots.')
-
 parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range')
 parser.add_argument('output_file', help='Output file name (.docx or .html)')
-
 args = parser.parse_args()
 
-def initialChecks():
-    # Check for root permissions
-    if os.geteuid() == 0:
-        print("This script is being attempted to run with root permissions. Please run as a regular user because it is insecure visiting pages with root permissions.")
+def initial_checks():
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("Run as a regular user, not root.")
         sys.exit(1)
-
-    # Check for write permissions in the current directory
     try:
         test_file_path = os.path.join(os.getcwd(), "temp_test_file")
-        with open(test_file_path, 'w') as test_file:
-            test_file.write("test")
+        with open(test_file_path, 'w') as f:
+            f.write("test")
         os.remove(test_file_path)
-    except IOError as e:
-        print("The script does not have write permissions in the current directory.")
-        print("Please change to a directory with write permissions or adjust the permissions of the current directory.")
+    except IOError:
+        print("No write permissions in current directory.")
         sys.exit(1)
 
-# Call the initial checks function
-initialChecks()
+initial_checks()
 
-def is_ip_range(ip_range):
-    return '-' in ip_range
-
-def generateIpsFromComplexRange(range_str):
-    octet_parts = range_str.split('.')
-    octet_ranges = [range(int(part.split('-')[0]), int(part.split('-')[1]) + 1) if '-' in part else [int(part)] for part in octet_parts]
-    return ['.'.join(map(str, combination)) for combination in product(*octet_ranges)]
-
-def expandIPRange_or_singleIP(input_value):
-    return expandIPrange(input_value) if '-' in input_value else [input_value]
-
-def expandIPRange(ip_range):
-    start_ip, end_ip = ip_range.split('-')
-    if '.' not in end_ip:
-        start_ip_base = '.'.join(start_ip.split('.')[:-1])
-        end_ip = f"{start_ip_base}.{end_ip}"
-    start = ipaddress.IPv4Address(start_ip)
-    end = ipaddress.IPv4Address(end_ip)
-    return [str(ip) for ip in range(int(start), int(end) + 1)]
-
-def handleInput(input_value):
-    if '/' in input_value:
-        # Handle CIDR notation more robustly, including error handling
-        try:
-            return [str(ip) for ip in ipaddress.ip_network(input_value, strict=False).hosts()]
-        except ValueError as e:
-            print(f"Error parsing CIDR notation '{input_value}': {e}")
-            return []
-
-    elif '-' in input_value and input_value.count('.') == 3:
-        # Simplified decision tree for handling complex ranges directly
-        return generateIpsFromComplexRange(input_value) if input_value.count('-') >= 1 else expandIPRange_or_singleIP(input_value)
-
+def handle_input(input_value):
+    if os.path.isfile(input_value):
+        all_hosts = []
+        with open(input_value, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    all_hosts.extend(parse_single_host_or_range(line))
+        return all_hosts
     else:
-        # Default case handles single IPs or unexpected formats gracefully
-        return expandIPRange_or_singleIP(input_value)
+        return parse_single_host_or_range(input_value)
 
-def gatherTomes():
-    required_libraries = ['selenium', 'docx', 'webdriver_manager', 'ipaddress', 'tqdm']
-    missing_libraries = []
+def parse_single_host_or_range(text):
+    for prefix in ("http://", "https://", "ftp://"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):].rstrip("/")
+            break
+    if '/' in text:
+        return expand_cidr(text)
+    if '-' in text:
+        return expand_any_dash_range(text)
+    return parse_single_ip_or_domain(text)
 
-    for library in required_libraries:
+def parse_single_ip_or_domain(input_str):
+    try:
+        ip_obj = ipaddress.ip_address(input_str)
+        return [str(ip_obj)]
+    except ValueError:
+        return [input_str]
+
+def expand_cidr(cidr_str):
+    try:
+        network = ipaddress.ip_network(cidr_str, strict=False)
+        return [str(ip) for ip in network.hosts()]
+    except ValueError:
+        return parse_single_ip_or_domain(cidr_str)
+
+def expand_any_dash_range(range_str):
+    if range_str.count('-') > 1:
+        return generate_ips_from_complex_range(range_str)
+    else:
         try:
-            __import__(library)
+            return expand_ip_range(range_str)
+        except ValueError:
+            return generate_ips_from_complex_range(range_str)
+
+def generate_ips_from_complex_range(range_str):
+    octet_parts = range_str.split('.')
+    octet_ranges = []
+    for part in octet_parts:
+        if '-' in part:
+            start_s, end_s = part.split('-')
+            octet_ranges.append(range(int(start_s), int(end_s) + 1))
+        else:
+            octet_ranges.append([int(part)])
+    expanded_ips = []
+    for combo in product(*octet_ranges):
+        try:
+            ip_obj = ipaddress.ip_address('.'.join(map(str, combo)))
+            expanded_ips.append(str(ip_obj))
+        except ValueError:
+            continue
+    return expanded_ips
+
+def expand_ip_range(ip_range_str):
+    start_ip_str, end_ip_str = ip_range_str.split('-')
+    if '.' not in end_ip_str:
+        base = '.'.join(start_ip_str.split('.')[:-1])
+        end_ip_str = f"{base}.{end_ip_str}"
+    start_ip = ipaddress.ip_address(start_ip_str)
+    end_ip = ipaddress.ip_address(end_ip_str)
+    return [str(ipaddress.ip_address(ip_int)) for ip_int in range(int(start_ip), int(end_ip) + 1)]
+
+def gather_tomes():
+    required_libraries = ['selenium', 'docx', 'webdriver_manager', 'ipaddress', 'tqdm']
+    missing = []
+    for lib in required_libraries:
+        try:
+            __import__(lib)
         except ImportError:
-            missing_libraries.append(library)
-    
-    if missing_libraries:
-        print("Missing some libraries. Please install them before running this good script.")
-        for lib in missing_libraries:
-            print(f"- {lib}")
+            missing.append(lib)
+    if missing:
+        print("Missing libraries: " + ", ".join(missing))
         sys.exit(1)
 
-# Checking if libraries are present
-gatherTomes()
+gather_tomes()
 
-def whisperWinds(text):
+def whisper_winds(text):
     tqdm.write(f"\033[92m{text}\033[0m")
 
-def peekPortals(host, port, timeout=10):
+def peek_portals(host, port, timeout=10):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             tqdm.write(f"Port {port} is open on {host}")
@@ -115,167 +141,148 @@ def peekPortals(host, port, timeout=10):
 
 hosts_to_capture = []
 
-def scoutLands(host, progress_bar):
+def scout_lands(host, progress_bar):
     schemes = []
-    if peekPortals(host, 443):
+    if peek_portals(host, 443):
         schemes.append('https')
-    if peekPortals(host, 80):
+    if peek_portals(host, 80):
         schemes.append('http')
     if schemes:
         hosts_to_capture.append((host, schemes))
     progress_bar.update(1)
 
-def summonSteeds():
+def summon_steeds():
     options = Options()
     options.headless = True
     options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
     service = FirefoxService(executable_path=GeckoDriverManager().install())
-    
-    #instantiate the Firefox WebDriver with the updated arguments
     driver = webdriver.Firefox(service=service, options=options)
     driver.set_page_load_timeout(30)
     return driver
 
-def capture_screenshot(driver, url, screenshot_path):
+def capture_screenshot_data(driver, url):
     try:
         driver.get(url)
-        if driver.save_screenshot(screenshot_path):
-            return True
-        else:
-            tqdm.write(f"Failed to save screenshot for {url}")
-            return False
+        png_data = driver.get_screenshot_as_png()
+        base64_data = base64.b64encode(png_data).decode('utf-8')
+        return True, png_data, base64_data
     except Exception as e:
-        return False
+        tqdm.write(f"Failed to capture screenshot for {url}: {e}")
+        return False, None, None
 
-def encodeImageBase64(screenshot_path):
-    try:
-        with open(screenshot_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
-    except Exception as e:
-        tqdm.write(f"Failed to read or encode the file {screenshot_path}: {e}")
-        return None
-
-def captureVisionsHTML(driver, output_file, progress_bar):
+def capture_visions_html(driver, output_file, progress_bar):
     items = []
-    temp_files_to_delete = []  # List to keep track of temporary screenshot file paths
-
     for host, schemes in hosts_to_capture:
         for scheme in schemes:
             url = f"{scheme}://{host}"
-            screenshot_filename = f'temp_screenshot_{host.replace(".", "_")}.png'
-            screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
-            if capture_screenshot(driver, url, screenshot_path):
-                items.append((url, screenshot_path))
-                temp_files_to_delete.append(screenshot_path)
-                whisperWinds(f"Successfully captured {url}")
-        progress_bar.update(1)
+            success, _, b64_data = capture_screenshot_data(driver, url)
+            if success:
+                items.append((url, b64_data))
+                whisper_winds(f"Successfully captured {url}")
+            progress_bar.update(1)
+    html_lines = [
+        "<html>",
+        "<head>",
+        "  <title>Web Server Screenshots</title>",
+        "  <style>",
+        "    body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; color: #333; }",
+        "    h1 { text-align: center; margin-bottom: 30px; }",
+        "    table { margin: 0 auto; border-collapse: collapse; width: 90%; max-width: 1000px; box-shadow: 0 2px 5px rgba(0,0,0,0.15); }",
+        "    th, td { border: 1px solid #ccc; padding: 12px; text-align: center; }",
+        "    th { background-color: #e0e0e0; }",
+        "    tr:nth-child(even) { background-color: #fafafa; }",
+        "    img { max-width: 700px; border-radius: 5px; }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        "  <h1>Web Server Screenshots</h1>",
+        "  <table>",
+        "    <tr><th>Web Request Info</th><th>Web Screenshot</th></tr>"
+    ]
+    for url, b64 in items:
+        html_lines.append(f"    <tr><td>{url}</td><td><img src='data:image/png;base64,{b64}'></td></tr>")
+    html_lines.append("  </table>")
+    html_lines.append("</body>")
+    html_lines.append("</html>")
+    with open(output_file, 'w') as f:
+        f.write("\n".join(html_lines))
 
-    html_content = ["<html><head><title>Web Server Screenshots</title></head><body>",
-                    "<h1>Web Server Screenshots</h1>",
-                    "<table border='1'>",
-                    "<tr><th>Web Request Info</th><th>Web Screenshot</th></tr>"]
-    
-    for url, screenshot_path in items:
-        try:
-            with open(screenshot_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-            html_content.append(f"<tr><td>{url}</td><td><img src='data:image/png;base64,{base64_image}' width='350'></td></tr>")
-        except IOError as e:
-            tqdm.write(f"Error reading screenshot file {screenshot_path}: {e}")
-
-    html_content.append("</table></body></html>")
-
-    with open(output_file, 'w') as file:
-        file.writelines(html_content)
-
-    clean_up_files(temp_files_to_delete)  # Utilize a helper function to clean up files
-
-def clean_up_files(file_paths):
-    for file_path in file_paths:
-        if os.path.exists(file_path):  # Check if the file exists before trying to delete it
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                pass
-        else:
-            pass
-
-def captureVisions(driver, output_file, progress_bar):
+def capture_visions_docx(driver, output_file, progress_bar):
+    import docx.shared
+    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+    from docx.shared import Pt
     doc = docx.Document()
+    title_paragraph = doc.add_paragraph()
+    title_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    title_run = title_paragraph.add_run("Web Server Screenshots")
+    title_run.bold = True
+    title_run.font.size = Pt(24)
+    doc.add_paragraph("")
     table = doc.add_table(rows=1, cols=2)
+    table.style = 'Light Grid Accent 1'
     hdr_cells = table.rows[0].cells
     hdr_cells[0].text = 'Web Request Info'
     hdr_cells[1].text = 'Web Screenshot'
-    
     for host, schemes in hosts_to_capture:
         for scheme in schemes:
             url = f"{scheme}://{host}"
-            screenshot_path = 'temp_screenshot.png'
-            if capture_screenshot(driver, url, screenshot_path):
+            success, png_data, _ = capture_screenshot_data(driver, url)
+            if success:
                 row_cells = table.add_row().cells
                 row_cells[0].text = url
+                image_stream = BytesIO(png_data)
                 paragraph = row_cells[1].paragraphs[0]
                 run = paragraph.add_run()
-                run.add_picture(screenshot_path, width=Inches(3.5))
-                os.remove(screenshot_path)
-                whisperWinds(f"Successfully captured {url}")
-        progress_bar.update(1)
-
+                run.add_picture(image_stream, width=docx.shared.Inches(3.5))
+                whisper_winds(f"Successfully captured {url}")
+            progress_bar.update(1)
+    section = doc.sections[0]
+    footer = section.footer
+    footer_paragraph = footer.paragraphs[0]
+    footer_paragraph.text = "Generated by NetGazer"
+    footer_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
     doc.save(output_file)
 
-def unravelScrolls(hosts):
-    expanded_hosts = []
+def unravel_scrolls(hosts):
+    expanded = []
     for host in hosts:
         try:
             network = ipaddress.ip_network(host, strict=False)
-            for ip in network.hosts():
-                expanded_hosts.append(str(ip))
+            expanded.extend([str(ip) for ip in network.hosts()])
         except ValueError:
-            expanded_hosts.append(host)
-    return expanded_hosts
+            expanded.append(host)
+    return expanded
 
-def embarkQuest(input_value, output_file):
-    # Determine if input is a file or direct IP/CIDR/range input
-    try:
-        # Attempt to treat the input as a file path
-        with open(input_value, 'r') as file:
-            hosts = [host.strip() for host in file if host.strip()]
-    except IOError:
-        # If an error occurs, assume input is not a file but direct input
-        hosts = handleInput(input_value)
-
-    expanded_hosts = unravelScrolls(hosts)
-
+def embark_quest(input_value, output_file):
+    hosts = handle_input(input_value)
+    expanded_hosts = unravel_scrolls(hosts)
     print("Starting port scan...")
-    progress_bar = tqdm(total=len(expanded_hosts), unit='host', desc="Port scanning", leave=False)
+    progress_bar_scan = tqdm(total=len(expanded_hosts), unit='host', desc="Port scanning", leave=False)
     with ThreadPoolExecutor(max_workers=30) as executor:
-        futures = [executor.submit(scoutLands, host, progress_bar) for host in expanded_hosts]
+        futures = [executor.submit(scout_lands, host, progress_bar_scan) for host in expanded_hosts]
         for future in futures:
             future.result()
-    progress_bar.close()
+    progress_bar_scan.close()
     print("Port scan finished.")
-
     print("Beginning screen capture...")
-    progress_bar = tqdm(total=len(hosts_to_capture), unit='host', desc="Screen capturing", leave=False)
-
-    driver = summonSteeds()
-
-    # Determine output format and call appropriate function
+    progress_bar_capture = tqdm(total=len(hosts_to_capture), unit='host', desc="Screen capturing", leave=False)
+    driver = summon_steeds()
     if output_file.endswith('.docx'):
-        captureVisions(driver, output_file, progress_bar)
+        capture_visions_docx(driver, output_file, progress_bar_capture)
     elif output_file.endswith('.html'):
-        captureVisionsHTML(driver, output_file, progress_bar)
+        capture_visions_html(driver, output_file, progress_bar_capture)
     else:
         print("Unsupported file format. Please use .docx or .html.")
         driver.quit()
         sys.exit(1)
-
-    progress_bar.close()
+    progress_bar_capture.close()
     print("Screen capture finished.")
     driver.quit()
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python netgazer.py <hosts_file> <output_file>")
+        print("Usage: python netgazer.py <hosts_file | IP/CIDR/range/domain> <output_file>")
     else:
-        embarkQuest(sys.argv[1], sys.argv[2])
+        embark_quest(sys.argv[1], sys.argv[2])
+
