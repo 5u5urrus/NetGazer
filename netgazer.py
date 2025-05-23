@@ -18,6 +18,7 @@ import docx
 from docx.shared import Inches
 from io import BytesIO
 import logging
+import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -52,12 +53,19 @@ def handle_input(input_value):
         return all_hosts
     else:
         return parse_single_host_or_range(input_value)
-
+    
 def parse_single_host_or_range(text):
+    # strip off any URL scheme
     for prefix in ("http://", "https://", "ftp://"):
         if text.lower().startswith(prefix):
             text = text[len(prefix):].rstrip("/")
             break
+
+    # ---- NEW: if there's any letter, it's a hostname, not an IP range ----
+    if re.search(r"[A-Za-z]", text):
+        return [text]
+
+    # now only numeric inputs remain
     if '/' in text:
         return expand_cidr(text)
     if '-' in text:
