@@ -20,6 +20,8 @@ from io import BytesIO
 import logging
 import re
 
+WEB_HTTPS_PORTS = {443, 8443, 10443, 9443}
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 parser = argparse.ArgumentParser(description='Scan and capture web server screenshots.')
@@ -139,24 +141,66 @@ gather_tomes()
 def whisper_winds(text):
     tqdm.write(f"\033[92m{text}\033[0m")
 
-def peek_portals(host, port, timeout=10):
+def peek_portals_fast(host, port, timeout=3):
+    """
+    Faster port checking with optimized socket settings.
+    Reduced timeout and socket optimizations for speed.
+    """
+    if ':' in host:
+        host, port_part = host.rsplit(':', 1)
+        try:
+            port = int(port_part)
+        except ValueError:
+            return False
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        # Socket optimizations for faster scanning
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        if result == 0:
             tqdm.write(f"Port {port} is open on {host}")
             return True
+        return False
     except Exception:
         return False
 
 hosts_to_capture = []
-
-def scout_lands(host, progress_bar):
-    schemes = []
-    if peek_portals(host, 443):
-        schemes.append('https')
-    if peek_portals(host, 80):
-        schemes.append('http')
-    if schemes:
-        hosts_to_capture.append((host, schemes))
+    
+def scout_lands_parallel(host, progress_bar):
+    """
+    Optimized version that checks ports in parallel per host.
+    Much faster than sequential port checking.
+    """
+    if ':' in host:  # Host with explicit port
+        host_part, port_part = host.rsplit(':', 1)
+        try:
+            port = int(port_part)
+        except ValueError:
+            progress_bar.update(1)
+            return
+        scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
+        if peek_portals_fast(host_part, port):
+            hosts_to_capture.append((f"{host_part}:{port}", [scheme]))
+    else:  # Check both 80 and 443 in parallel
+        schemes = []
+        
+        # Use ThreadPoolExecutor to check ports concurrently for this host
+        with ThreadPoolExecutor(max_workers=2) as port_executor:
+            # Submit both port checks simultaneously
+            future_443 = port_executor.submit(peek_portals_fast, host, 443)
+            future_80 = port_executor.submit(peek_portals_fast, host, 80)
+            
+            # Collect results
+            if future_443.result():
+                schemes.append('https')
+            if future_80.result():
+                schemes.append('http')
+        
+        if schemes:
+            hosts_to_capture.append((host, schemes))
+    
     progress_bar.update(1)
 
 def summon_steeds():
@@ -164,6 +208,8 @@ def summon_steeds():
     options.headless = True
     options.add_argument("--headless")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     service = FirefoxService(executable_path=GeckoDriverManager().install())
     driver = webdriver.Firefox(service=service, options=options)
     driver.set_page_load_timeout(30)
@@ -257,40 +303,63 @@ def unravel_scrolls(hosts):
     for host in hosts:
         try:
             network = ipaddress.ip_network(host, strict=False)
-            expanded.extend([str(ip) for ip in network.hosts()])
+            if network.prefixlen == network.max_prefixlen:
+                # It's a single IP like /32 or /128 — just include it
+                expanded.append(str(network.network_address))
+            else:
+                expanded.extend([str(ip) for ip in network.hosts()])
         except ValueError:
+            # Not a valid network (likely a hostname or host:port)
             expanded.append(host)
     return expanded
-
+    
 def embark_quest(input_value, output_file):
     hosts = handle_input(input_value)
     expanded_hosts = unravel_scrolls(hosts)
-    print("Starting port scan...")
+    
+    if not expanded_hosts:
+        print("No hosts to scan.")
+        return
+    
+    print(f"Starting optimized port scan on {len(expanded_hosts)} host(s)...")
     progress_bar_scan = tqdm(total=len(expanded_hosts), unit='host', desc="Port scanning", leave=False)
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        futures = [executor.submit(scout_lands, host, progress_bar_scan) for host in expanded_hosts]
+    
+    # Increased workers since individual operations are now faster
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = [executor.submit(scout_lands_parallel, host, progress_bar_scan) for host in expanded_hosts]
         for future in futures:
             future.result()
+    
     progress_bar_scan.close()
     print("Port scan finished.")
+    
+    if not hosts_to_capture:
+        print("No web servers found on scanned hosts.")
+        return
+    
     print("Beginning screen capture...")
-    progress_bar_capture = tqdm(total=len(hosts_to_capture), unit='host', desc="Screen capturing", leave=False)
+    
+    # Calculate total screenshot attempts correctly
+    total_screenshots = sum(len(schemes) for _, schemes in hosts_to_capture)
+    progress_bar_capture = tqdm(total=total_screenshots, unit='screenshot', desc="Screen capturing", leave=False)
+    
     driver = summon_steeds()
-    if output_file.endswith('.docx'):
-        capture_visions_docx(driver, output_file, progress_bar_capture)
-    elif output_file.endswith('.html'):
-        capture_visions_html(driver, output_file, progress_bar_capture)
-    else:
-        print("Unsupported file format. Please use .docx or .html.")
+    try:
+        if output_file.endswith('.docx'):
+            capture_visions_docx(driver, output_file, progress_bar_capture)
+        elif output_file.endswith('.html'):
+            capture_visions_html(driver, output_file, progress_bar_capture)
+        else:
+            print("Unsupported file format. Please use .docx or .html.")
+            sys.exit(1)
+        print("Screen capture finished.")
+    finally:
+        # Ensure both driver and progress bar are always cleaned up
+        progress_bar_capture.close()
         driver.quit()
-        sys.exit(1)
-    progress_bar_capture.close()
-    print("Screen capture finished.")
-    driver.quit()
-
+        
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python netgazer.py <hosts_file | IP/CIDR/range/domain> <output_file>")
     else:
         embark_quest(sys.argv[1], sys.argv[2])
-
