@@ -1,365 +1,802 @@
-# Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
-# Author: Vahe Demirkhanyan
 #!/usr/bin/env python3
+"""
+Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
+Author: Vahe Demirkhanyan
+"""
+
 import base64
 import os
 import sys
 import argparse
 import ipaddress
-from itertools import product
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
+import re
 import socket
+import time
+import logging
+from itertools import product
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+from pathlib import Path
+from typing import List, Tuple, Optional, Iterator, Set, Dict, Union
+
+import docx
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.enum.table import WD_ALIGN_VERTICAL
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.firefox import GeckoDriverManager
-import docx
-from docx.shared import Inches
-from io import BytesIO
-import logging
-import re
+from tqdm import tqdm
 
-WEB_HTTPS_PORTS = {443, 8443, 10443, 9443}
+# Constants
+WEB_HTTPS_PORTS: frozenset[int] = frozenset({443, 8443, 10443, 9443})
+DEFAULT_PORTS: List[int] = [80, 443]
+DEFAULT_TIMEOUT: int = 30
+MAX_PORT_WORKERS: int = 50
+MAX_PORT_CHECK_WORKERS: int = 10
+PORT_CHECK_TIMEOUT: int = 3
+URL_PREFIXES: Tuple[str, ...] = ("http://", "https://", "ftp://")
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-parser = argparse.ArgumentParser(description='Scan and capture web server screenshots.')
-parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range')
-parser.add_argument('output_file', help='Output file name (.docx or .html)')
-args = parser.parse_args()
+# Performance optimization: Pre-compile regex patterns
+URL_PATTERN = re.compile(r"[A-Za-z]")
 
-def initial_checks():
+class NetworkScanner:
+    """Handles host parsing and network operations."""
+    
+    @staticmethod
+    def parse_hosts(input_value: str) -> List[str]:
+        """Parse input into list of hosts."""
+        input_path = Path(input_value)
+        return (NetworkScanner._parse_hosts_file(input_path) 
+                if input_path.is_file() 
+                else NetworkScanner._parse_single_input(input_value))
+    
+    @staticmethod
+    def _parse_hosts_file(filepath: Path) -> List[str]:
+        """Parse hosts from file."""
+        hosts = []
+        try:
+            with filepath.open('r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        try:
+                            hosts.extend(NetworkScanner._parse_single_input(line))
+                        except Exception as e:
+                            logger.warning(f"Skipping invalid line {line_num} in {filepath}: {e}")
+        except IOError as e:
+            logger.error(f"Error reading file {filepath}: {e}")
+            sys.exit(1)
+        return hosts
+    
+    @staticmethod
+    def _parse_single_input(text: str) -> List[str]:
+        """Parse a single host/range/CIDR input."""
+        # Remove URL schemes efficiently - optimized to avoid repeated lower() calls
+        for prefix in URL_PREFIXES:
+            if text.startswith(prefix) or text.startswith(prefix.upper()):
+                text = text[len(prefix):].rstrip("/")
+                break
+        
+        # If contains letters, treat as hostname - use precompiled regex
+        if URL_PATTERN.search(text):
+            return [text]
+        
+        # Handle numeric inputs
+        if '/' in text:
+            return NetworkScanner._expand_cidr(text)
+        if '-' in text:
+            return NetworkScanner._expand_range(text)
+        
+        # Single IP or domain - validate IP
+        try:
+            ipaddress.ip_address(text)
+            return [text]
+        except ValueError:
+            return [text]  # Assume it's a valid hostname
+    
+    @staticmethod
+    def _expand_cidr(cidr_str: str) -> List[str]:
+        """Expand CIDR notation to IP list."""
+        try:
+            network = ipaddress.ip_network(cidr_str, strict=False)
+            # For single IPs (/32 or /128), return the address
+            return ([str(network.network_address)] if network.num_addresses <= 2 
+                   else [str(ip) for ip in network.hosts()])
+        except ValueError as e:
+            logger.error(f"Invalid CIDR notation '{cidr_str}': {e}")
+            return []
+    
+    @staticmethod
+    def _expand_range(range_str: str) -> List[str]:
+        """Expand IP ranges like 192.168.1.1-10 or 192.168.1-2.1-10."""
+        dash_count = range_str.count('-')
+        if dash_count == 1:
+            return NetworkScanner._expand_simple_range(range_str)
+        elif dash_count > 1:
+            return NetworkScanner._expand_complex_range(range_str)
+        return []
+    
+    @staticmethod
+    def _expand_simple_range(range_str: str) -> List[str]:
+        """Expand simple range like 192.168.1.1-10."""
+        try:
+            start_ip_str, end_str = range_str.split('-', 1)
+            
+            # If end doesn't contain dots, append to start's base
+            if '.' not in end_str:
+                base = '.'.join(start_ip_str.split('.')[:-1])
+                end_ip_str = f"{base}.{end_str}"
+            else:
+                end_ip_str = end_str
+            
+            start_ip = ipaddress.ip_address(start_ip_str)
+            end_ip = ipaddress.ip_address(end_ip_str)
+            
+            return [str(ipaddress.ip_address(ip_int)) 
+                   for ip_int in range(int(start_ip), int(end_ip) + 1)]
+        except (ValueError, ipaddress.AddressValueError) as e:
+            logger.error(f"Invalid IP range '{range_str}': {e}")
+            return []
+    
+    @staticmethod
+    def _expand_complex_range(range_str: str) -> List[str]:
+        """Expand complex ranges like 192.168.1-2.1-10."""
+        try:
+            octet_parts = range_str.split('.')
+            if len(octet_parts) != 4:
+                raise ValueError("Invalid IP format")
+                
+            octet_ranges = []
+            for part in octet_parts:
+                if '-' in part:
+                    start_s, end_s = part.split('-', 1)
+                    start_val, end_val = int(start_s), int(end_s)
+                    if not (0 <= start_val <= 255 and 0 <= end_val <= 255):
+                        raise ValueError("Octet out of range")
+                    octet_ranges.append(range(start_val, end_val + 1))
+                else:
+                    val = int(part)
+                    if not (0 <= val <= 255):
+                        raise ValueError("Octet out of range")
+                    octet_ranges.append([val])
+            
+            return ['.'.join(map(str, combo)) for combo in product(*octet_ranges)]
+            
+        except (ValueError, IndexError) as e:
+            logger.error(f"Invalid complex range '{range_str}': {e}")
+            return []
+
+
+class PortScanner:
+    """Handles port scanning operations."""
+    
+    @staticmethod
+    def check_port(host: str, port: int, timeout: int = PORT_CHECK_TIMEOUT) -> bool:
+        """Fast port connectivity check."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                result = sock.connect_ex((host, port))
+                
+                if result == 0:
+                    tqdm.write(f"Port {port} is open on {host}")
+                    return True
+                return False
+        except (socket.error, OSError):
+            return False
+    
+    @staticmethod
+    def scan_host(host: str, ports: List[int], progress_bar: tqdm) -> Optional[Tuple[str, List[Tuple[int, str]]]]:
+        """Scan all ports for a single host."""
+        # Handle explicit port in hostname
+        if ':' in host:
+            host_part, port_part = host.rsplit(':', 1)
+            try:
+                port = int(port_part)
+                scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
+                if PortScanner.check_port(host_part, port):
+                    progress_bar.update(1)
+                    return (f"{host_part}:{port}", [(port, scheme)])
+            except ValueError:
+                pass  # Invalid port, skip
+            progress_bar.update(1)
+            return None
+        
+        # Scan multiple ports concurrently
+        open_ports = []
+        max_workers = min(len(ports), MAX_PORT_CHECK_WORKERS)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_port = {
+                executor.submit(PortScanner.check_port, host, port): port 
+                for port in ports
+            }
+            
+            for future in as_completed(future_to_port):
+                port = future_to_port[future]
+                try:
+                    if future.result():
+                        scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
+                        open_ports.append((port, scheme))
+                except Exception as e:
+                    logger.debug(f"Port check failed for {host}:{port}: {e}")
+        
+        progress_bar.update(1)
+        return (host, open_ports) if open_ports else None
+
+
+class WebDriverManager:
+    """Manages Selenium WebDriver operations."""
+    
+    _driver_cache: Optional[webdriver.Firefox] = None
+    _driver_options_cache: Optional[Options] = None
+    
+    @classmethod
+    def _get_cached_options(cls) -> Options:
+        """Get cached Firefox options to avoid recreating them."""
+        if cls._driver_options_cache is None:
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            
+            # Firefox-specific preferences
+            prefs = {
+                "dom.webdriver.enabled": False,
+                "useAutomationExtension": False,
+                "media.volume_scale": "0.0",  # Mute audio
+                "dom.ipc.plugins.enabled.libflashplayer.so": "false"  # Disable Flash
+            }
+            for pref, value in prefs.items():
+                options.set_preference(pref, value)
+            
+            cls._driver_options_cache = options
+        
+        return cls._driver_options_cache
+    
+    @classmethod
+    def create_driver(cls, timeout: int = DEFAULT_TIMEOUT) -> webdriver.Firefox:
+        """Create configured Firefox WebDriver with caching."""
+        if cls._driver_cache is None:
+            options = cls._get_cached_options()
+            
+            try:
+                service = FirefoxService(executable_path=GeckoDriverManager().install())
+                cls._driver_cache = webdriver.Firefox(service=service, options=options)
+                cls._driver_cache.set_page_load_timeout(timeout)
+                
+                # Anti-detection measures
+                cls._driver_cache.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            except Exception as e:
+                logger.error(f"Failed to create WebDriver: {e}")
+                sys.exit(1)
+        
+        return cls._driver_cache
+    
+    @classmethod
+    def cleanup_driver(cls) -> None:
+        """Clean up cached driver."""
+        if cls._driver_cache:
+            try:
+                cls._driver_cache.quit()
+            except Exception:
+                pass
+            cls._driver_cache = None
+    
+    @staticmethod
+    def capture_screenshot(driver: webdriver.Firefox, url: str, follow_redirects: bool = False, 
+                         timeout: int = DEFAULT_TIMEOUT) -> Tuple[bool, Optional[bytes], Optional[str], str]:
+        """Capture screenshot of a web page."""
+        try:
+            driver.get(url)
+            
+            # Smart wait configuration
+            js_wait_time = min(max(timeout // 4, 3), 15)
+            
+            # Initial wait for basic page load
+            time.sleep(2)
+            
+            # Optimized waiting strategy
+            try:
+                # Wait for document ready state
+                WebDriverWait(driver, js_wait_time).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                
+                # Wait for Angular apps (non-blocking)
+                try:
+                    driver.execute_script(
+                        "return typeof window.getAllAngularTestabilities === 'undefined' || "
+                        "window.getAllAngularTestabilities().every(function(t) { return t.isStable(); })"
+                    )
+                except Exception:
+                    pass  # Not Angular or timeout
+                
+                # Wait for meaningful content
+                WebDriverWait(driver, js_wait_time).until(
+                    lambda d: len(d.find_element(By.TAG_NAME, "body").text.strip()) > 50
+                )
+                
+            except TimeoutException:
+                # Fallback wait
+                time.sleep(min(js_wait_time, 5))
+            
+            # Validate content quality
+            body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
+            if len(body_text) < 50 and len(driver.page_source) < 1000:
+                tqdm.write(f"Warning: {url} appears to have minimal content after {js_wait_time}s wait")
+            
+            final_url = driver.current_url if follow_redirects else url
+            png_data = driver.get_screenshot_as_png()
+            base64_data = base64.b64encode(png_data).decode('utf-8')
+            
+            return True, png_data, base64_data, final_url
+            
+        except WebDriverException as e:
+            tqdm.write(f"WebDriver error for {url}: {e}")
+            return False, None, None, url
+        except Exception as e:
+            tqdm.write(f"Failed to capture screenshot for {url}: {e}")
+            return False, None, None, url
+
+
+class DocumentGenerator:
+    """Handles document generation in HTML and DOCX formats."""
+    
+    # HTML template as class constant for better performance
+    HTML_TEMPLATE = """<html>
+<head>
+  <title>Web Server Screenshots</title>
+  <meta charset='UTF-8'>
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; color: #333; }}
+    h1 {{ text-align: center; margin-bottom: 30px; }}
+    table {{ 
+      margin: 0 auto; 
+      border-collapse: collapse; 
+      width: 90%; 
+      max-width: 1200px; 
+      box-shadow: 0 2px 5px rgba(0,0,0,0.15); 
+      table-layout: fixed;
+    }}
+    th, td {{ 
+      border: 1px solid #ccc; 
+      padding: 12px; 
+      text-align: center; 
+      vertical-align: top;
+    }}
+    th {{ background-color: #e0e0e0; }}
+    tr:nth-child(even) {{ background-color: #fafafa; }}
+    th:first-child, td:first-child {{ 
+      width: 25%; 
+      min-width: 200px; 
+      max-width: 300px;
+    }}
+    th:last-child, td:last-child {{ width: 75%; }}
+    .url-text {{ 
+      word-wrap: break-word; 
+      word-break: break-all; 
+      overflow-wrap: break-word; 
+      hyphens: auto; 
+      line-height: 1.4; 
+      font-size: 12px; 
+      text-align: left; 
+      padding: 8px;
+    }}
+    img {{ 
+      max-width: 100%; 
+      height: auto; 
+      border-radius: 5px; 
+      display: block; 
+      margin: 0 auto;
+    }}
+    @media (max-width: 768px) {{
+      table {{ width: 100%; }}
+      th:first-child, td:first-child {{ width: 30%; }}
+      th:last-child, td:last-child {{ width: 70%; }}
+      .url-text {{ font-size: 10px; }}
+    }}
+  </style>
+</head>
+<body>
+  <h1>Web Server Screenshots</h1>
+  <table>
+    <tr><th>Web Request Info</th><th>Web Screenshot</th></tr>
+{rows}
+  </table>
+</body>
+</html>"""
+    
+    @staticmethod
+    def build_url(host: str, port: int, scheme: str) -> str:
+        """Build clean URL from components."""
+        is_standard_port = (port == 80 and scheme == 'http') or (port == 443 and scheme == 'https')
+        return f"{scheme}://{host}" if is_standard_port else f"{scheme}://{host}:{port}"
+    
+    @staticmethod
+    def _process_screenshot_batch(driver: webdriver.Firefox, 
+                                 host_port_batches: List[Tuple[str, int, str]], 
+                                 progress_bar: tqdm, 
+                                 follow_redirects: bool, 
+                                 timeout: int) -> List[Tuple[str, str]]:
+        """Process a batch of screenshots and return results."""
+        items = []
+        
+        for host, port, scheme in host_port_batches:
+            url = DocumentGenerator.build_url(host, port, scheme)
+            
+            success, _, b64_data, final_url = WebDriverManager.capture_screenshot(
+                driver, url, follow_redirects, timeout
+            )
+            
+            if success and b64_data:
+                display_text = url if url == final_url else f"{url} → {final_url}"
+                items.append((display_text, b64_data))
+                whisper_winds(f"Successfully captured {url}" + 
+                            (f" (redirected to {final_url})" if url != final_url else ""))
+            
+            progress_bar.update(1)
+        
+        return items
+    
+    @classmethod
+    def generate_html(cls, driver: webdriver.Firefox, output_file: str, 
+                     hosts_to_capture: List[Tuple[str, List[Tuple[int, str]]]], 
+                     progress_bar: tqdm, follow_redirects: bool = False, 
+                     timeout: int = DEFAULT_TIMEOUT) -> None:
+        """Generate HTML document with screenshots."""
+        # Flatten host/port combinations for batch processing
+        host_port_batches = [
+            (host, port, scheme)
+            for host, port_scheme_list in hosts_to_capture
+            for port, scheme in port_scheme_list
+        ]
+        
+        items = cls._process_screenshot_batch(
+            driver, host_port_batches, progress_bar, follow_redirects, timeout
+        )
+        
+        # Generate HTML content with optimized string building - use list comprehension with join
+        rows = [
+            f"    <tr><td><span class='url-text'>{url}</span></td>"
+            f"<td><img src='data:image/png;base64,{b64}' alt='Screenshot of {url}'></td></tr>"
+            for url, b64 in items
+        ]
+        
+        html_content = cls.HTML_TEMPLATE.format(rows='\n'.join(rows))
+        
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+        except IOError as e:
+            logger.error(f"Failed to write HTML file {output_file}: {e}")
+            sys.exit(1)
+    
+    @staticmethod
+    def generate_docx(driver: webdriver.Firefox, output_file: str, 
+                     hosts_to_capture: List[Tuple[str, List[Tuple[int, str]]]], 
+                     progress_bar: tqdm, follow_redirects: bool = False, 
+                     timeout: int = DEFAULT_TIMEOUT) -> None:
+        """Generate DOCX document with screenshots."""
+        try:
+            doc = docx.Document()
+            
+            # Add title
+            title_paragraph = doc.add_paragraph()
+            title_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            title_run = title_paragraph.add_run("Web Server Screenshots")
+            title_run.bold = True
+            title_run.font.size = Pt(24)
+            doc.add_paragraph("")
+            
+            # Create table
+            table = doc.add_table(rows=1, cols=2)
+            table.style = 'Light Grid Accent 1'
+            table.autofit = False
+            
+            # Set column widths
+            table.columns[0].width = Inches(2.0)  # URL column
+            table.columns[1].width = Inches(4.0)  # Image column
+            
+            # Set header
+            hdr_cells = table.rows[0].cells
+            hdr_cells[0].text = 'Web Request Info'
+            hdr_cells[1].text = 'Web Screenshot'
+            
+            for cell in hdr_cells:
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+                cell.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+            
+            # Add screenshots
+            for host, port_scheme_list in hosts_to_capture:
+                for port, scheme in port_scheme_list:
+                    url = DocumentGenerator.build_url(host, port, scheme)
+                    
+                    success, png_data, _, final_url = WebDriverManager.capture_screenshot(
+                        driver, url, follow_redirects, timeout
+                    )
+                    
+                    if not success or not png_data:
+                        progress_bar.update(1)
+                        continue
+                    
+                    # Add table row
+                    row_cells = table.add_row().cells
+                    url_cell = row_cells[0]
+                    
+                    display_text = url if url == final_url else f"{url} → {final_url}"
+                    url_cell.text = display_text
+                    url_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+                    url_cell.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+                    
+                    # Add screenshot - optimize BytesIO usage
+                    with BytesIO(png_data) as img_buf:
+                        pic_run = row_cells[1].paragraphs[0].add_run()
+                        pic_run.add_picture(img_buf, width=Inches(4.0))
+                    
+                    whisper_winds(f"Successfully captured {url}" + 
+                                (f" (redirected to {final_url})" if url != final_url else ""))
+                    progress_bar.update(1)
+            
+            # Add footer
+            section = doc.sections[0]
+            footer = section.footer
+            footer_paragraph = footer.paragraphs[0]
+            footer_paragraph.text = "Generated by NetGazer"
+            footer_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            
+            doc.save(output_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to generate DOCX file {output_file}: {e}")
+            sys.exit(1)
+
+
+def comma_separated_ints(value: str) -> List[int]:
+    """Parse comma-separated port list with validation."""
+    try:
+        ports = [int(p.strip()) for p in value.split(',') if p.strip()]
+        if not ports:
+            raise ValueError("No valid ports provided")
+        
+        invalid_ports = [p for p in ports if not 1 <= p <= 65535]
+        if invalid_ports:
+            raise ValueError(f"Ports out of valid range (1-65535): {invalid_ports}")
+        
+        return sorted(set(ports))  # Remove duplicates and sort
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid port specification: {e}")
+
+
+def check_dependencies() -> None:
+    """Check for required libraries with detailed error messages."""
+    required_libs = {
+        'selenium': 'selenium',
+        'docx': 'python-docx', 
+        'webdriver_manager': 'webdriver-manager',
+        'tqdm': 'tqdm'
+    }
+    missing = []
+    
+    for import_name, package_name in required_libs.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(package_name)
+    
+    if missing:
+        print(f"Missing required libraries: {', '.join(missing)}")
+        print(f"Install with: pip install {' '.join(missing)}")
+        sys.exit(1)
+
+
+def initial_checks() -> None:
+    """Perform comprehensive initial system checks."""
+    # Check if running as root (Unix-like systems)
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("Run as a regular user, not root.")
         sys.exit(1)
+    
+    # Check write permissions in current directory
+    test_file = Path.cwd() / "temp_test_file"
     try:
-        test_file_path = os.path.join(os.getcwd(), "temp_test_file")
-        with open(test_file_path, 'w') as f:
-            f.write("test")
-        os.remove(test_file_path)
-    except IOError:
+        test_file.write_text("test")
+        test_file.unlink()
+    except (IOError, OSError, PermissionError):
         print("No write permissions in current directory.")
         sys.exit(1)
-
-initial_checks()
-
-def handle_input(input_value):
-    if os.path.isfile(input_value):
-        all_hosts = []
-        with open(input_value, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    all_hosts.extend(parse_single_host_or_range(line))
-        return all_hosts
-    else:
-        return parse_single_host_or_range(input_value)
     
-def parse_single_host_or_range(text):
-    # strip off any URL scheme
-    for prefix in ("http://", "https://", "ftp://"):
-        if text.lower().startswith(prefix):
-            text = text[len(prefix):].rstrip("/")
-            break
+    # Check dependencies
+    check_dependencies()
 
-    # ---- NEW: if there's any letter, it's a hostname, not an IP range ----
-    if re.search(r"[A-Za-z]", text):
-        return [text]
 
-    # now only numeric inputs remain
-    if '/' in text:
-        return expand_cidr(text)
-    if '-' in text:
-        return expand_any_dash_range(text)
-    return parse_single_ip_or_domain(text)
-
-def parse_single_ip_or_domain(input_str):
-    try:
-        ip_obj = ipaddress.ip_address(input_str)
-        return [str(ip_obj)]
-    except ValueError:
-        return [input_str]
-
-def expand_cidr(cidr_str):
-    try:
-        network = ipaddress.ip_network(cidr_str, strict=False)
-        return [str(ip) for ip in network.hosts()]
-    except ValueError:
-        return parse_single_ip_or_domain(cidr_str)
-
-def expand_any_dash_range(range_str):
-    if range_str.count('-') > 1:
-        return generate_ips_from_complex_range(range_str)
-    else:
-        try:
-            return expand_ip_range(range_str)
-        except ValueError:
-            return generate_ips_from_complex_range(range_str)
-
-def generate_ips_from_complex_range(range_str):
-    octet_parts = range_str.split('.')
-    octet_ranges = []
-    for part in octet_parts:
-        if '-' in part:
-            start_s, end_s = part.split('-')
-            octet_ranges.append(range(int(start_s), int(end_s) + 1))
-        else:
-            octet_ranges.append([int(part)])
-    expanded_ips = []
-    for combo in product(*octet_ranges):
-        try:
-            ip_obj = ipaddress.ip_address('.'.join(map(str, combo)))
-            expanded_ips.append(str(ip_obj))
-        except ValueError:
-            continue
-    return expanded_ips
-
-def expand_ip_range(ip_range_str):
-    start_ip_str, end_ip_str = ip_range_str.split('-')
-    if '.' not in end_ip_str:
-        base = '.'.join(start_ip_str.split('.')[:-1])
-        end_ip_str = f"{base}.{end_ip_str}"
-    start_ip = ipaddress.ip_address(start_ip_str)
-    end_ip = ipaddress.ip_address(end_ip_str)
-    return [str(ipaddress.ip_address(ip_int)) for ip_int in range(int(start_ip), int(end_ip) + 1)]
-
-def gather_tomes():
-    required_libraries = ['selenium', 'docx', 'webdriver_manager', 'ipaddress', 'tqdm']
-    missing = []
-    for lib in required_libraries:
-        try:
-            __import__(lib)
-        except ImportError:
-            missing.append(lib)
-    if missing:
-        print("Missing libraries: " + ", ".join(missing))
-        sys.exit(1)
-
-gather_tomes()
-
-def whisper_winds(text):
+def whisper_winds(text: str) -> None:
+    """Print colored success message with ANSI codes."""
     tqdm.write(f"\033[92m{text}\033[0m")
 
-def peek_portals_fast(host, port, timeout=3):
-    """
-    Faster port checking with optimized socket settings.
-    Reduced timeout and socket optimizations for speed.
-    """
-    if ':' in host:
-        host, port_part = host.rsplit(':', 1)
-        try:
-            port = int(port_part)
-        except ValueError:
-            return False
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        # Socket optimizations for faster scanning
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        if result == 0:
-            tqdm.write(f"Port {port} is open on {host}")
-            return True
-        return False
-    except Exception:
-        return False
 
-hosts_to_capture = []
+def expand_hosts(hosts: List[str]) -> List[str]:
+    """Expand network ranges in host list with deduplication."""
+    expanded_hosts = []
+    seen = set()
     
-def scout_lands_parallel(host, progress_bar):
-    """
-    Optimized version that checks ports in parallel per host.
-    Much faster than sequential port checking.
-    """
-    if ':' in host:  # Host with explicit port
-        host_part, port_part = host.rsplit(':', 1)
-        try:
-            port = int(port_part)
-        except ValueError:
-            progress_bar.update(1)
-            return
-        scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
-        if peek_portals_fast(host_part, port):
-            hosts_to_capture.append((f"{host_part}:{port}", [scheme]))
-    else:  # Check both 80 and 443 in parallel
-        schemes = []
-        
-        # Use ThreadPoolExecutor to check ports concurrently for this host
-        with ThreadPoolExecutor(max_workers=2) as port_executor:
-            # Submit both port checks simultaneously
-            future_443 = port_executor.submit(peek_portals_fast, host, 443)
-            future_80 = port_executor.submit(peek_portals_fast, host, 80)
-            
-            # Collect results
-            if future_443.result():
-                schemes.append('https')
-            if future_80.result():
-                schemes.append('http')
-        
-        if schemes:
-            hosts_to_capture.append((host, schemes))
-    
-    progress_bar.update(1)
-
-def summon_steeds():
-    options = Options()
-    options.headless = True
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    service = FirefoxService(executable_path=GeckoDriverManager().install())
-    driver = webdriver.Firefox(service=service, options=options)
-    driver.set_page_load_timeout(30)
-    return driver
-
-def capture_screenshot_data(driver, url):
-    try:
-        driver.get(url)
-        png_data = driver.get_screenshot_as_png()
-        base64_data = base64.b64encode(png_data).decode('utf-8')
-        return True, png_data, base64_data
-    except Exception as e:
-        tqdm.write(f"Failed to capture screenshot for {url}: {e}")
-        return False, None, None
-
-def capture_visions_html(driver, output_file, progress_bar):
-    items = []
-    for host, schemes in hosts_to_capture:
-        for scheme in schemes:
-            url = f"{scheme}://{host}"
-            success, _, b64_data = capture_screenshot_data(driver, url)
-            if success:
-                items.append((url, b64_data))
-                whisper_winds(f"Successfully captured {url}")
-            progress_bar.update(1)
-    html_lines = [
-        "<html>",
-        "<head>",
-        "  <title>Web Server Screenshots</title>",
-        "  <style>",
-        "    body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; color: #333; }",
-        "    h1 { text-align: center; margin-bottom: 30px; }",
-        "    table { margin: 0 auto; border-collapse: collapse; width: 90%; max-width: 1000px; box-shadow: 0 2px 5px rgba(0,0,0,0.15); }",
-        "    th, td { border: 1px solid #ccc; padding: 12px; text-align: center; }",
-        "    th { background-color: #e0e0e0; }",
-        "    tr:nth-child(even) { background-color: #fafafa; }",
-        "    img { max-width: 700px; border-radius: 5px; }",
-        "  </style>",
-        "</head>",
-        "<body>",
-        "  <h1>Web Server Screenshots</h1>",
-        "  <table>",
-        "    <tr><th>Web Request Info</th><th>Web Screenshot</th></tr>"
-    ]
-    for url, b64 in items:
-        html_lines.append(f"    <tr><td>{url}</td><td><img src='data:image/png;base64,{b64}'></td></tr>")
-    html_lines.append("  </table>")
-    html_lines.append("</body>")
-    html_lines.append("</html>")
-    with open(output_file, 'w') as f:
-        f.write("\n".join(html_lines))
-
-def capture_visions_docx(driver, output_file, progress_bar):
-    import docx.shared
-    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-    from docx.shared import Pt
-    doc = docx.Document()
-    title_paragraph = doc.add_paragraph()
-    title_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    title_run = title_paragraph.add_run("Web Server Screenshots")
-    title_run.bold = True
-    title_run.font.size = Pt(24)
-    doc.add_paragraph("")
-    table = doc.add_table(rows=1, cols=2)
-    table.style = 'Light Grid Accent 1'
-    hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = 'Web Request Info'
-    hdr_cells[1].text = 'Web Screenshot'
-    for host, schemes in hosts_to_capture:
-        for scheme in schemes:
-            url = f"{scheme}://{host}"
-            success, png_data, _ = capture_screenshot_data(driver, url)
-            if success:
-                row_cells = table.add_row().cells
-                row_cells[0].text = url
-                image_stream = BytesIO(png_data)
-                paragraph = row_cells[1].paragraphs[0]
-                run = paragraph.add_run()
-                run.add_picture(image_stream, width=docx.shared.Inches(3.5))
-                whisper_winds(f"Successfully captured {url}")
-            progress_bar.update(1)
-    section = doc.sections[0]
-    footer = section.footer
-    footer_paragraph = footer.paragraphs[0]
-    footer_paragraph.text = "Generated by NetGazer"
-    footer_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    doc.save(output_file)
-
-def unravel_scrolls(hosts):
-    expanded = []
     for host in hosts:
         try:
             network = ipaddress.ip_network(host, strict=False)
-            if network.prefixlen == network.max_prefixlen:
-                # It's a single IP like /32 or /128 — just include it
-                expanded.append(str(network.network_address))
+            if network.num_addresses <= 2:
+                ip_str = str(network.network_address)
+                if ip_str not in seen:
+                    expanded_hosts.append(ip_str)
+                    seen.add(ip_str)
             else:
-                expanded.extend([str(ip) for ip in network.hosts()])
+                for ip in network.hosts():
+                    ip_str = str(ip)
+                    if ip_str not in seen:
+                        expanded_hosts.append(ip_str)
+                        seen.add(ip_str)
         except ValueError:
-            # Not a valid network (likely a hostname or host:port)
-            expanded.append(host)
-    return expanded
+            if host not in seen:
+                expanded_hosts.append(host)
+                seen.add(host)
     
-def embark_quest(input_value, output_file):
-    hosts = handle_input(input_value)
-    expanded_hosts = unravel_scrolls(hosts)
+    return expanded_hosts
+
+
+def perform_port_scan(hosts: List[str], ports: List[int]) -> List[Tuple[str, List[Tuple[int, str]]]]:
+    """Perform optimized port scanning on all hosts."""
+    hosts_to_capture = []
     
-    if not expanded_hosts:
-        print("No hosts to scan.")
-        return
+    print(f"Starting optimized port scan on {len(hosts)} host(s) with ports {ports}...")
     
-    print(f"Starting optimized port scan on {len(expanded_hosts)} host(s)...")
-    progress_bar_scan = tqdm(total=len(expanded_hosts), unit='host', desc="Port scanning", leave=False)
+    with tqdm(total=len(hosts), unit='host', desc="Port scanning", leave=False) as pbar:
+        with ThreadPoolExecutor(max_workers=MAX_PORT_WORKERS) as executor:
+            futures = {
+                executor.submit(PortScanner.scan_host, host, ports, pbar): host
+                for host in hosts
+            }
+            
+            for future in as_completed(futures):
+                host = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        hosts_to_capture.append(result)
+                except Exception as e:
+                    logger.error(f"Error during port scan for {host}: {e}")
     
-    # Increased workers since individual operations are now faster
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        futures = [executor.submit(scout_lands_parallel, host, progress_bar_scan) for host in expanded_hosts]
-        for future in futures:
-            future.result()
-    
-    progress_bar_scan.close()
     print("Port scan finished.")
+    return hosts_to_capture
+
+
+def perform_screenshot_capture(hosts_to_capture: List[Tuple[str, List[Tuple[int, str]]]], 
+                             output_file: str, follow_redirects: bool, timeout: int) -> None:
+    """Perform screenshot capture phase with improved error handling."""
+    # Calculate total screenshots
+    total_screenshots = sum(len(port_list) for _, port_list in hosts_to_capture)
+    
+    js_wait_time = min(max(timeout // 4, 3), 15)
+    redirect_text = " (following redirects)" if follow_redirects else ""
+    print(f"Beginning screen capture with {timeout}s page timeout, "
+          f"{js_wait_time}s JavaScript wait{redirect_text}...")
+    
+    # Screenshot capture phase
+    driver = WebDriverManager.create_driver(timeout)
+    try:
+        output_path = Path(output_file)
+        with tqdm(total=total_screenshots, unit='screenshot', desc="Screen capturing", leave=False) as pbar:
+            if output_path.suffix.lower() == '.docx':
+                DocumentGenerator.generate_docx(driver, output_file, hosts_to_capture, pbar, follow_redirects, timeout)
+            else:
+                DocumentGenerator.generate_html(driver, output_file, hosts_to_capture, pbar, follow_redirects, timeout)
+        
+        print("Screen capture finished.")
+        
+    finally:
+        WebDriverManager.cleanup_driver()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate command line arguments."""
+    # Validate output file extension
+    output_path = Path(args.output_file)
+    if output_path.suffix.lower() not in ['.html', '.docx']:
+        print("Error: Output file must have .html or .docx extension")
+        sys.exit(1)
+    
+    # Validate timeout
+    if args.timeout <= 0:
+        print("Error: Timeout must be positive")
+        sys.exit(1)
+    
+    # Check if output directory is writable
+    output_dir = output_path.parent
+    if not output_dir.exists():
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            print(f"Error: Cannot create output directory {output_dir}")
+            sys.exit(1)
+    
+    if not os.access(output_dir, os.W_OK):
+        print(f"Error: No write permission for output directory {output_dir}")
+        sys.exit(1)
+
+
+def main() -> None:
+    """Main execution function with improved error handling."""
+    parser = argparse.ArgumentParser(
+        description='Scan and capture web server screenshots.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s hosts.txt results.html
+  %(prog)s 192.168.1.0/24 scan.docx --timeout 45 --redirect
+  %(prog)s targets.txt output.html --ports 8080,8443,9000
+  %(prog)s example.com results.html --ports 80,443,8080,8443,9090
+        """
+    )
+    
+    parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range')
+    parser.add_argument('output_file', help='Output file name (.docx or .html)')
+    parser.add_argument('--timeout', '-t', type=int, default=DEFAULT_TIMEOUT,
+                       help=f'Page load timeout in seconds (default: {DEFAULT_TIMEOUT})')
+    parser.add_argument('--redirect', '-r', action='store_true',
+                       help='Follow redirects and capture final destination (default: False)')
+    parser.add_argument('--ports', '-p', type=comma_separated_ints, default=DEFAULT_PORTS,
+                       help='Comma-separated list of ports to scan (default: 80,443)')
+    
+    args = parser.parse_args()
+    
+    # Perform initial checks
+    initial_checks()
+    
+    # Validate arguments
+    validate_args(args)
+    
+    # Parse and expand hosts
+    hosts = NetworkScanner.parse_hosts(args.input)
+    if not hosts:
+        print("No valid hosts found to scan.")
+        sys.exit(1)
+    
+    expanded_hosts = expand_hosts(hosts)
+    if not expanded_hosts:
+        print("No hosts to scan after expansion.")
+        sys.exit(1)
+    
+    # Perform port scanning
+    hosts_to_capture = perform_port_scan(expanded_hosts, args.ports)
     
     if not hosts_to_capture:
         print("No web servers found on scanned hosts.")
         return
     
-    print("Beginning screen capture...")
-    
-    # Calculate total screenshot attempts correctly
-    total_screenshots = sum(len(schemes) for _, schemes in hosts_to_capture)
-    progress_bar_capture = tqdm(total=total_screenshots, unit='screenshot', desc="Screen capturing", leave=False)
-    
-    driver = summon_steeds()
-    try:
-        if output_file.endswith('.docx'):
-            capture_visions_docx(driver, output_file, progress_bar_capture)
-        elif output_file.endswith('.html'):
-            capture_visions_html(driver, output_file, progress_bar_capture)
-        else:
-            print("Unsupported file format. Please use .docx or .html.")
-            sys.exit(1)
-        print("Screen capture finished.")
-    finally:
-        # Ensure both driver and progress bar are always cleaned up
-        progress_bar_capture.close()
-        driver.quit()
-        
+    # Perform screenshot capture
+    perform_screenshot_capture(hosts_to_capture, args.output_file, args.redirect, args.timeout)
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python netgazer.py <hosts_file | IP/CIDR/range/domain> <output_file>")
+        print("Usage: python netgazer.py <hosts_file | IP/CIDR/range/domain> <output_file> [--timeout SECONDS] [--redirect] [--ports PORT1,PORT2,...]")
+        print("Examples:")
+        print("  python netgazer.py hosts.txt results.html")
+        print("  python netgazer.py 192.168.1.0/24 scan.docx --timeout 45 --redirect")
+        print("  python netgazer.py targets.txt output.html --ports 8080,8443,9000")
+        print("  python netgazer.py example.com results.html --ports 80,443,8080,8443,9090")
     else:
-        embark_quest(sys.argv[1], sys.argv[2])
+        main()
