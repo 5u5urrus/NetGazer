@@ -33,6 +33,7 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.firefox import GeckoDriverManager
 from tqdm import tqdm
 from urllib.parse import urlparse
+from threading import Lock
 
 # Constants
 WEB_HTTPS_PORTS: frozenset[int] = frozenset({443, 8443, 10443, 9443})
@@ -45,6 +46,57 @@ PORT_CHECK_TIMEOUT: int = 3
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# DNS cache for faster / more predictable port checks across many ports
+_DNS_CACHE: dict[str, list[tuple[int, tuple]]] = {}
+_DNS_LOCK = Lock()
+
+
+def _sockaddr_with_port(sockaddr: tuple, port: int) -> tuple:
+    # IPv4 sockaddr: (ip, port)
+    if len(sockaddr) == 2:
+        return (sockaddr[0], port)
+    # IPv6 sockaddr: (ip, port, flowinfo, scopeid)
+    if len(sockaddr) == 4:
+        return (sockaddr[0], port, sockaddr[2], sockaddr[3])
+    return sockaddr
+
+
+def resolve_host_cached(host: str, prefer_ipv4: bool = True) -> list[tuple[int, tuple]]:
+    """
+    Returns list of (family, sockaddr_without_port) for host.
+    Cached to avoid repeated DNS lookups across many ports.
+    """
+    with _DNS_LOCK:
+        if host in _DNS_CACHE:
+            addrs = _DNS_CACHE[host]
+            return addrs if not prefer_ipv4 else sorted(addrs, key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+
+    # If it's already a literal IP, bypass DNS
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.version == 4:
+            addrs = [(socket.AF_INET, (host, 0))]
+        else:
+            addrs = [(socket.AF_INET6, (host, 0, 0, 0))]
+    except ValueError:
+        # DNS resolution (both v4+v6)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        # Deduplicate + keep only AF_INET/AF_INET6
+        seen = set()
+        addrs = []
+        for family, _, _, _, sockaddr in infos:
+            if family not in (socket.AF_INET, socket.AF_INET6):
+                continue
+            key = (family, sockaddr)
+            if key not in seen:
+                seen.add(key)
+                addrs.append((family, sockaddr))
+
+    with _DNS_LOCK:
+        _DNS_CACHE[host] = addrs
+
+    return addrs if not prefer_ipv4 else sorted(addrs, key=lambda x: 0 if x[0] == socket.AF_INET else 1)
 
 
 def is_ipv6(addr: str) -> bool:
@@ -244,13 +296,25 @@ class PortScanner:
 
     @staticmethod
     def check_port(host: str, port: int, timeout: int = PORT_CHECK_TIMEOUT) -> bool:
-        """Fast port connectivity check (IPv4/IPv6)."""
+        """Fast port connectivity check (IPv4/IPv6) with cached resolution + connect_ex."""
         try:
-            with socket.create_connection((host, port), timeout=timeout):
-                tqdm.write(f"Port {port} is open on {host}")
-                return True
+            addr_list = resolve_host_cached(host, prefer_ipv4=True)
         except OSError:
             return False
+
+        for family, sockaddr0 in addr_list:
+            sockaddr = _sockaddr_with_port(sockaddr0, port)
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(timeout)
+                    rc = sock.connect_ex(sockaddr)
+                    if rc == 0:
+                        tqdm.write(f"Port {port} is open on {host}")
+                        return True
+            except OSError:
+                continue
+
+        return False
 
     @staticmethod
     def scan_host(host: str, ports: List[int], progress_bar: tqdm) -> Optional[Tuple[str, List[Tuple[int, str]]]]:
@@ -261,28 +325,42 @@ class PortScanner:
             scheme = 'https' if explicit_port in WEB_HTTPS_PORTS else 'http'
             if PortScanner.check_port(h, explicit_port):
                 progress_bar.update(1)
-                return (f"{h}:{explicit_port}", [(explicit_port, scheme)])
+                return (h, [(explicit_port, scheme)])
             progress_bar.update(1)
             return None
 
-        # Scan multiple ports concurrently
         open_ports = []
-        max_workers = min(len(ports), MAX_PORT_CHECK_WORKERS)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_port = {
-                executor.submit(PortScanner.check_port, h, port): port
-                for port in ports
-            }
-
-            for future in as_completed(future_to_port):
-                port = future_to_port[future]
+        # Micro fast-path: for 1–2 ports, avoid spinning up a per-host thread pool
+        if len(ports) <= 2:
+            for port in ports:
                 try:
-                    if future.result():
+                    if PortScanner.check_port(h, port):
                         scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
                         open_ports.append((port, scheme))
                 except Exception as e:
                     logger.debug(f"Port check failed for {h}:{port}: {e}")
+        else:
+            # Scan multiple ports concurrently
+            max_workers = min(len(ports), MAX_PORT_CHECK_WORKERS)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_port = {
+                    executor.submit(PortScanner.check_port, h, port): port
+                    for port in ports
+                }
+
+                for future in as_completed(future_to_port):
+                    port = future_to_port[future]
+                    try:
+                        if future.result():
+                            scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
+                            open_ports.append((port, scheme))
+                    except Exception as e:
+                        logger.debug(f"Port check failed for {h}:{port}: {e}")
+
+        # Deterministic ordering of open ports
+        open_ports.sort(key=lambda x: x[0])
 
         progress_bar.update(1)
         return (h, open_ports) if open_ports else None
@@ -758,6 +836,10 @@ def perform_port_scan(hosts: List[str], ports: List[int]) -> List[Tuple[str, Lis
 
     print(f"Starting optimized port scan on {len(hosts)} host(s) with ports {ports}...")
 
+    # Deterministic ordering: preserve host order from input list
+    host_order = {h: i for i, h in enumerate(hosts)}
+    ordered_results: List[Tuple[int, Tuple[str, List[Tuple[int, str]]]]] = []
+
     with tqdm(total=len(hosts), unit='host', desc="Port scanning", leave=False) as pbar:
         with ThreadPoolExecutor(max_workers=MAX_PORT_WORKERS) as executor:
             futures = {
@@ -770,9 +852,12 @@ def perform_port_scan(hosts: List[str], ports: List[int]) -> List[Tuple[str, Lis
                 try:
                     result = future.result()
                     if result:
-                        hosts_to_capture.append(result)
+                        ordered_results.append((host_order.get(host, 10**9), result))
                 except Exception as e:
                     logger.error(f"Error during port scan for {host}: {e}")
+
+    ordered_results.sort(key=lambda x: x[0])
+    hosts_to_capture = [r for _, r in ordered_results]
 
     print("Port scan finished.")
     return hosts_to_capture
