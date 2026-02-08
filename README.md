@@ -1,5 +1,9 @@
 NetGazer is designed to efficiently capture screenshots of websites and web servers based on a predefined list of IP addresses and URLs. It then meticulously organizes and presents these results in a Word document table.
 
+<p align="center">
+  <img src="netgazer.jpg" width="100%" alt="fuzz Banner">
+</p>
+
 Finally you will have EyeWitness that works normally. :) Welcome NetGazer.
 
 <h2>NetGazer: Web Server Screenshot Capturer</h2>
