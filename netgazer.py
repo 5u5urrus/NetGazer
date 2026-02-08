@@ -1,78 +1,257 @@
 #!/usr/bin/env python3
 """
-Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
+NetGazer - Scan for web servers, capture their screens and place them in an HTML or word document table (docx)
 Author: Vahe Demirkhanyan
 """
 
+from __future__ import annotations
+
+import atexit
 import base64
-import os
-import sys
-import argparse
+import html
 import ipaddress
+import os
 import re
 import socket
+import ssl
+import sys
+import tempfile
 import time
 import logging
-from itertools import product
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import errno
+
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from datetime import datetime
 from io import BytesIO
+from itertools import product
 from pathlib import Path
-from typing import List, Tuple, Optional, Iterator, Set, Dict, Union
+from threading import Lock, local
+from typing import List, Tuple, Optional, Dict, Iterator
 
-import docx
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx.enum.table import WD_ALIGN_VERTICAL
-from selenium import webdriver
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.firefox import GeckoDriverManager
-from tqdm import tqdm
-from urllib.parse import urlparse
-from threading import Lock
 
-# Constants
-WEB_HTTPS_PORTS: frozenset[int] = frozenset({443, 8443, 10443, 9443})
+# ── Optional deps (loaded safely so we can print a clean error) ────────
+try:
+    import docx
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+    from docx.enum.table import WD_ALIGN_VERTICAL
+except ImportError:
+    docx = None
+    Inches = Pt = RGBColor = WD_PARAGRAPH_ALIGNMENT = WD_ALIGN_VERTICAL = None  # type: ignore
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.firefox.service import Service as FirefoxService
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.common.exceptions import (
+        TimeoutException,
+        WebDriverException,
+        UnexpectedAlertPresentException,
+        NoSuchWindowException,
+    )
+except ImportError:
+    webdriver = None
+    FirefoxService = Options = WebDriverWait = None  # type: ignore
+    TimeoutException = WebDriverException = UnexpectedAlertPresentException = NoSuchWindowException = None  # type: ignore
+
+try:
+    from webdriver_manager.firefox import GeckoDriverManager
+except ImportError:
+    GeckoDriverManager = None  # type: ignore
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None  # type: ignore
+
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse  # type: ignore
+
+import argparse
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Constants
+# ═══════════════════════════════════════════════════════════════
+
 DEFAULT_PORTS: List[int] = [80, 443]
 DEFAULT_TIMEOUT: int = 30
-MAX_PORT_WORKERS: int = 50
-MAX_PORT_CHECK_WORKERS: int = 10
-PORT_CHECK_TIMEOUT: int = 3
 
-# Configure logging
+MAX_PORT_WORKERS: int = 50
+PORT_CHECK_TIMEOUT: int = 3
+TLS_PROBE_TIMEOUT: float = 2.0
+
+_TITLE_MAX_LEN = 80
+_BROWSER_RESET_EVERY = 25
+
+# Parallel capture: keep modest so we don't swamp RAM with Firefox instances.
+# Each headless Firefox ≈ 200-300 MB.  3 is a good default.
+_MAX_SHOT_WORKERS = 3
+
+_MAX_FULLPAGE_HEIGHT = 22000
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Interesting-page tag detection
+# ═══════════════════════════════════════════════════════════════
+
+_TAG_BADGE_COLORS: Dict[str, str] = {
+    "LOGIN":   "#e67e22",
+    "ADMIN":   "#e74c3c",
+    "API":     "#8e44ad",
+    "DEFAULT": "#3498db",
+    "403":     "#f39c12",
+    "401":     "#f39c12",
+    "404":     "#95a5a6",
+    "ERROR":   "#c0392b",
+}
+
+
+def _detect_tags(title: str, url: str = "", final_url: str = "") -> List[str]:
+    t = (title or "").lower()
+    u = (url or "").lower()
+    fu = (final_url or "").lower()
+    blob = " ".join([t, u, fu])
+
+    tags: List[str] = []
+
+    if any(k in blob for k in ("login", "sign in", "log in", "signin",
+                              "authenticate", "password", "credentials",
+                              "/login", "/signin", "/auth")):
+        tags.append("LOGIN")
+
+    if any(k in blob for k in ("admin", "dashboard", "control panel",
+                              "management", "console", "webmin",
+                              "phpmyadmin", "grafana", "kibana",
+                              "jenkins", "portainer",
+                              "/admin", "/wp-admin", "/manager/html")):
+        tags.append("ADMIN")
+
+    if any(k in blob for k in ("/api", "swagger", "openapi", "graphql", "/v1/", "/v2/")):
+        tags.append("API")
+
+    if any(k in t for k in ("default page", "welcome to nginx",
+                            "apache2", "it works", "iis windows",
+                            "test page", "default web site",
+                            "congratulations", "coming soon",
+                            "under construction", "placeholder")):
+        tags.append("DEFAULT")
+
+    if "forbidden" in t or "403" in t:
+        tags.append("403")
+    if "unauthorized" in t or "401" in t:
+        tags.append("401")
+    if any(k in t for k in ("not found", "404")):
+        tags.append("404")
+    if any(k in t for k in ("internal server error", "500", "502",
+                            "503", "bad gateway", "service unavailable")):
+        tags.append("ERROR")
+
+    return tags
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Console helpers
+# ═══════════════════════════════════════════════════════════════
+
+def _c_green(t: str) -> str:  return f"\033[92m{t}\033[0m"
+def _c_yellow(t: str) -> str: return f"\033[93m{t}\033[0m"
+def _c_red(t: str) -> str:    return f"\033[91m{t}\033[0m"
+def _c_dim(t: str) -> str:    return f"\033[2m{t}\033[0m"
+def _c_bold(t: str) -> str:   return f"\033[1m{t}\033[0m"
+
+
+def _truncate(s: str, n: int = _TITLE_MAX_LEN) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _fmt_elapsed(secs: float) -> str:
+    if secs < 60:
+        return f"{secs:.1f}s"
+    m, s = divmod(secs, 60)
+    return f"{int(m)}m {s:.0f}s"
+
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _atomic_replace(src: Path, dst: Path) -> None:
+    try:
+        src.replace(dst)
+    except Exception:
+        shutil.move(str(src), str(dst))
+
+
+def _twrite(msg: str) -> None:
+    """Write a line through tqdm (if available) or plain print."""
+    try:
+        tqdm.write(msg)  # type: ignore[union-attr]
+    except Exception:
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Logging
+# ═══════════════════════════════════════════════════════════════
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# DNS cache for faster / more predictable port checks across many ports
+
+# ═══════════════════════════════════════════════════════════════
+#  DNS cache
+# ═══════════════════════════════════════════════════════════════
+
 _DNS_CACHE: dict[str, list[tuple[int, tuple]]] = {}
 _DNS_LOCK = Lock()
+_DNS_FAILS: set[str] = set()
+_DNS_FAILS_LOCK = Lock()
 
 
 def _sockaddr_with_port(sockaddr: tuple, port: int) -> tuple:
-    # IPv4 sockaddr: (ip, port)
     if len(sockaddr) == 2:
         return (sockaddr[0], port)
-    # IPv6 sockaddr: (ip, port, flowinfo, scopeid)
     if len(sockaddr) == 4:
         return (sockaddr[0], port, sockaddr[2], sockaddr[3])
     return sockaddr
 
 
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def resolve_host_cached(host: str, prefer_ipv4: bool = True) -> list[tuple[int, tuple]]:
-    """
-    Returns list of (family, sockaddr_without_port) for host.
-    Cached to avoid repeated DNS lookups across many ports.
-    """
+    with _DNS_FAILS_LOCK:
+        if host in _DNS_FAILS:
+            return []
+
     with _DNS_LOCK:
         if host in _DNS_CACHE:
             addrs = _DNS_CACHE[host]
             return addrs if not prefer_ipv4 else sorted(addrs, key=lambda x: 0 if x[0] == socket.AF_INET else 1)
 
-    # If it's already a literal IP, bypass DNS
+    addrs: list[tuple[int, tuple]] = []
+
     try:
         ip = ipaddress.ip_address(host)
         if ip.version == 4:
@@ -80,18 +259,20 @@ def resolve_host_cached(host: str, prefer_ipv4: bool = True) -> list[tuple[int, 
         else:
             addrs = [(socket.AF_INET6, (host, 0, 0, 0))]
     except ValueError:
-        # DNS resolution (both v4+v6)
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        # Deduplicate + keep only AF_INET/AF_INET6
-        seen = set()
-        addrs = []
-        for family, _, _, _, sockaddr in infos:
-            if family not in (socket.AF_INET, socket.AF_INET6):
-                continue
-            key = (family, sockaddr)
-            if key not in seen:
-                seen.add(key)
-                addrs.append((family, sockaddr))
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            seen = set()
+            for family, _, _, _, sockaddr in infos:
+                if family not in (socket.AF_INET, socket.AF_INET6):
+                    continue
+                key = (family, sockaddr)
+                if key not in seen:
+                    seen.add(key)
+                    addrs.append((family, sockaddr))
+        except (socket.gaierror, OSError):
+            addrs = []
+            with _DNS_FAILS_LOCK:
+                _DNS_FAILS.add(host)
 
     with _DNS_LOCK:
         _DNS_CACHE[host] = addrs
@@ -108,27 +289,17 @@ def is_ipv6(addr: str) -> bool:
 
 
 def split_host_port_maybe(s: str) -> Tuple[str, Optional[int]]:
-    """
-    Best-effort split of 'host[:port]' that is safe for IPv6.
-    - Supports '[IPv6]:port'
-    - If exactly one colon and the right side is digits, treat as host:port
-    - Otherwise, return (s, None)
-    """
     s = s.strip()
+    if s.startswith('[') and ']' in s:
+        end = s.index(']')
+        host = s[1:end]
+        rest = s[end + 1:]
+        if rest.startswith(':'):
+            port_part = rest[1:]
+            if port_part.isdigit():
+                return host, int(port_part)
+        return host, None
 
-    if s.startswith('['):
-        # [IPv6] or [IPv6]:port
-        if ']' in s:
-            end = s.index(']')
-            host = s[1:end]
-            rest = s[end + 1:]
-            if rest.startswith(':'):
-                port_part = rest[1:]
-                if port_part.isdigit():
-                    return host, int(port_part)
-            return host, None
-
-    # Non-bracketed: treat single-colon + digits as port
     if s.count(':') == 1:
         left, right = s.rsplit(':', 1)
         if right.isdigit():
@@ -137,12 +308,25 @@ def split_host_port_maybe(s: str) -> Tuple[str, Optional[int]]:
     return s, None
 
 
-class NetworkScanner:
-    """Handles host parsing and network operations."""
+# ═══════════════════════════════════════════════════════════════
+#  Network / host parsing
+# ═══════════════════════════════════════════════════════════════
 
+_IP_RANGEISH_RE = re.compile(r'^[0-9.\-]+$')
+_CIDRISH_RE = re.compile(r'^[0-9.:/]+$')
+
+
+def _looks_like_ip_range(token: str) -> bool:
+    return bool(_IP_RANGEISH_RE.match(token)) and "." in token
+
+
+def _looks_like_cidr(token: str) -> bool:
+    return bool(_CIDRISH_RE.match(token)) and "/" in token
+
+
+class NetworkScanner:
     @staticmethod
     def parse_hosts(input_value: str) -> List[str]:
-        """Parse input into list of hosts."""
         input_path = Path(input_value)
         return (NetworkScanner._parse_hosts_file(input_path)
                 if input_path.is_file()
@@ -150,17 +334,21 @@ class NetworkScanner:
 
     @staticmethod
     def _parse_hosts_file(filepath: Path) -> List[str]:
-        """Parse hosts from file."""
-        hosts = []
+        hosts: List[str] = []
         try:
             with filepath.open('r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
-                    if line and not line.startswith('#'):
-                        try:
-                            hosts.extend(NetworkScanner._parse_single_input(line))
-                        except Exception as e:
-                            logger.warning(f"Skipping invalid line {line_num} in {filepath}: {e}")
+                    if not line or line.startswith('#'):
+                        continue
+                    if '#' in line:
+                        line = line.split('#', 1)[0].strip()
+                        if not line:
+                            continue
+                    try:
+                        hosts.extend(NetworkScanner._parse_single_input(line))
+                    except Exception as e:
+                        logger.warning(f"Skipping invalid line {line_num} in {filepath}: {e}")
         except IOError as e:
             logger.error(f"Error reading file {filepath}: {e}")
             sys.exit(1)
@@ -168,59 +356,57 @@ class NetworkScanner:
 
     @staticmethod
     def _parse_single_input(text: str) -> List[str]:
-        """
-        Robustly parse a single host/range/CIDR/URL input.
-        - Properly handles URLs (http/https/ftp etc.), stripping path/query/fragment.
-        - Keeps IPv6 intact (supports [v6]:port syntax).
-        - Detects CIDR/ranges.
-        """
         raw = text.strip()
+        if not raw:
+            return []
 
-        # If it looks like a URL, use urlparse to extract the authority
         host_candidate = raw
+        had_scheme = False
+        if raw.startswith("//"):
+            raw = "http:" + raw
         if '://' in raw:
+            had_scheme = True
             u = urlparse(raw)
             host_candidate = u.netloc or u.path
-        else:
-            # Support protocol-relative //host
-            if raw.startswith('//'):
-                u = urlparse(raw)
-                host_candidate = u.netloc or u.path
 
-        # Strip any trailing path if user pasted host/path by mistake
-        host_candidate = host_candidate.split('/')[0]
+        # Only strip URL path components when input had a scheme.
+        # Raw CIDRs like "192.168.1.0/24" must NOT be split here.
+        if had_scheme:
+            host_candidate = host_candidate.split('/')[0]
+        host_candidate = host_candidate.strip().rstrip('.')
 
-        # Remove surrounding [] for IPv6 for internal handling
+        if "@" in host_candidate:
+            host_candidate = host_candidate.split("@", 1)[-1]
+
         if host_candidate.startswith('[') and ']' in host_candidate:
             host_inner = host_candidate[1:host_candidate.index(']')]
             rest = host_candidate[host_candidate.index(']') + 1:]
             if rest.startswith(':'):
-                # keep port with host string, let PortScanner handle it
                 host_candidate = f"{host_inner}{rest}"
             else:
                 host_candidate = host_inner
 
-        # Try exact IP first (v4/v6) – if this succeeds, it's a single host
         try:
             ipaddress.ip_address(host_candidate)
             return [host_candidate]
         except ValueError:
             pass
 
-        # CIDR?
-        if '/' in host_candidate:
+        if '/' in host_candidate and _looks_like_cidr(host_candidate):
             return NetworkScanner._expand_cidr(host_candidate)
 
-        # Range?
-        if '-' in host_candidate:
+        if '-' in host_candidate and _looks_like_ip_range(host_candidate):
             return NetworkScanner._expand_range(host_candidate)
 
-        # Hostname or host:port – keep as-is
+        # Fallback: if no scheme was given and a '/' remains (e.g. "host.com/path"),
+        # strip the path part and treat as plain hostname.
+        if '/' in host_candidate:
+            host_candidate = host_candidate.split('/')[0]
+
         return [host_candidate]
 
     @staticmethod
     def _expand_cidr(cidr_str: str) -> List[str]:
-        """Expand CIDR notation to IP list. Correctly handles /31 and /127."""
         try:
             network = ipaddress.ip_network(cidr_str, strict=False)
             if network.num_addresses == 1:
@@ -232,21 +418,17 @@ class NetworkScanner:
 
     @staticmethod
     def _expand_range(range_str: str) -> List[str]:
-        """Expand IP ranges like 192.168.1.1-10 or 192.168.1-2.1-10."""
         dash_count = range_str.count('-')
         if dash_count == 1:
             return NetworkScanner._expand_simple_range(range_str)
-        elif dash_count > 1:
+        if dash_count > 1:
             return NetworkScanner._expand_complex_range(range_str)
         return []
 
     @staticmethod
     def _expand_simple_range(range_str: str) -> List[str]:
-        """Expand simple range like 192.168.1.1-10."""
         try:
             start_ip_str, end_str = range_str.split('-', 1)
-
-            # If end doesn't contain dots, append to start's base
             if '.' not in end_str:
                 base = '.'.join(start_ip_str.split('.')[:-1])
                 end_ip_str = f"{base}.{end_str}"
@@ -264,7 +446,6 @@ class NetworkScanner:
 
     @staticmethod
     def _expand_complex_range(range_str: str) -> List[str]:
-        """Expand complex ranges like 192.168.1-2.1-10."""
         try:
             octet_parts = range_str.split('.')
             if len(octet_parts) != 4:
@@ -285,448 +466,981 @@ class NetworkScanner:
                     octet_ranges.append([val])
 
             return ['.'.join(map(str, combo)) for combo in product(*octet_ranges)]
-
         except (ValueError, IndexError) as e:
             logger.error(f"Invalid complex range '{range_str}': {e}")
             return []
 
 
-class PortScanner:
-    """Handles port scanning operations."""
+# ═══════════════════════════════════════════════════════════════
+#  Port scanner
+# ═══════════════════════════════════════════════════════════════
 
+_TLS_CTX_LOCK = Lock()
+_TLS_CTX: Optional[ssl.SSLContext] = None
+
+
+def _get_tls_ctx() -> ssl.SSLContext:
+    global _TLS_CTX
+    with _TLS_CTX_LOCK:
+        if _TLS_CTX is not None:
+            return _TLS_CTX
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _TLS_CTX = ctx
+        return ctx
+
+
+class PortScanner:
     @staticmethod
-    def check_port(host: str, port: int, timeout: int = PORT_CHECK_TIMEOUT) -> bool:
-        """Fast port connectivity check (IPv4/IPv6) with cached resolution + connect_ex."""
-        try:
-            addr_list = resolve_host_cached(host, prefer_ipv4=True)
-        except OSError:
-            return False
+    def probe_port_with_addrs(host: str, port: int, addr_list: List[Tuple[int, tuple]], timeout: int = PORT_CHECK_TIMEOUT) -> Tuple[bool, str]:
+        if not addr_list:
+            return False, "http"
+
+        sni_name = None if _is_ip_literal(host) else host
+        tls_ctx = _get_tls_ctx()
 
         for family, sockaddr0 in addr_list:
             sockaddr = _sockaddr_with_port(sockaddr0, port)
+            sock: Optional[socket.socket] = None
             try:
-                with socket.socket(family, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(timeout)
-                    rc = sock.connect_ex(sockaddr)
-                    if rc == 0:
-                        tqdm.write(f"Port {port} is open on {host}")
-                        return True
-            except OSError:
+                sock = socket.socket(family, socket.SOCK_STREAM)
+                sock.settimeout(float(timeout))
+                rc = sock.connect_ex(sockaddr)
+                if rc != 0:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    continue
+
+                scheme = "http"
+                try:
+                    sock.settimeout(float(min(timeout, TLS_PROBE_TIMEOUT)))
+                    with tls_ctx.wrap_socket(sock, server_hostname=sni_name, do_handshake_on_connect=False) as ssock:
+                        ssock.settimeout(float(TLS_PROBE_TIMEOUT))
+                        ssock.do_handshake()
+                    scheme = "https"
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+                return True, scheme
+
+            except OSError as e:
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+                if getattr(e, "errno", None) in (errno.EMFILE, errno.ENOBUFS, errno.EADDRNOTAVAIL, errno.EADDRINUSE):
+                    time.sleep(0.01)
                 continue
 
-        return False
+        return False, "http"
 
     @staticmethod
-    def scan_host(host: str, ports: List[int], progress_bar: tqdm) -> Optional[Tuple[str, List[Tuple[int, str]]]]:
-        """Scan all ports for a single host. Supports [IPv6]:port and host:port syntaxes."""
-        # Handle explicit port in hostname safely (IPv6-aware)
+    def probe_port(host: str, port: int, timeout: int = PORT_CHECK_TIMEOUT) -> Tuple[bool, str]:
+        addr_list = resolve_host_cached(host, prefer_ipv4=True)
+        return PortScanner.probe_port_with_addrs(host, port, addr_list, timeout)
+
+    @staticmethod
+    def scan_host(host: str, ports: List[int]) -> Optional[Tuple[str, List[Tuple[int, str]]]]:
         h, explicit_port = split_host_port_maybe(host)
-        if explicit_port is not None:
-            scheme = 'https' if explicit_port in WEB_HTTPS_PORTS else 'http'
-            if PortScanner.check_port(h, explicit_port):
-                progress_bar.update(1)
-                return (h, [(explicit_port, scheme)])
-            progress_bar.update(1)
+
+        addr_list = resolve_host_cached(h, prefer_ipv4=True)
+        if not addr_list:
             return None
 
-        open_ports = []
+        if explicit_port is not None:
+            ok, scheme = PortScanner.probe_port_with_addrs(h, explicit_port, addr_list)
+            return (h, [(explicit_port, scheme)]) if ok else None
 
-        # Micro fast-path: for 1–2 ports, avoid spinning up a per-host thread pool
-        if len(ports) <= 2:
-            for port in ports:
-                try:
-                    if PortScanner.check_port(h, port):
-                        scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
-                        open_ports.append((port, scheme))
-                except Exception as e:
-                    logger.debug(f"Port check failed for {h}:{port}: {e}")
-        else:
-            # Scan multiple ports concurrently
-            max_workers = min(len(ports), MAX_PORT_CHECK_WORKERS)
+        open_ports: List[Tuple[int, str]] = []
+        for port in ports:
+            ok, scheme = PortScanner.probe_port_with_addrs(h, port, addr_list)
+            if ok:
+                open_ports.append((port, scheme))
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_port = {
-                    executor.submit(PortScanner.check_port, h, port): port
-                    for port in ports
-                }
-
-                for future in as_completed(future_to_port):
-                    port = future_to_port[future]
-                    try:
-                        if future.result():
-                            scheme = 'https' if port in WEB_HTTPS_PORTS else 'http'
-                            open_ports.append((port, scheme))
-                    except Exception as e:
-                        logger.debug(f"Port check failed for {h}:{port}: {e}")
-
-        # Deterministic ordering of open ports
         open_ports.sort(key=lambda x: x[0])
-
-        progress_bar.update(1)
         return (h, open_ports) if open_ports else None
 
 
-class WebDriverManager:
-    """Manages Selenium WebDriver operations."""
+# ═══════════════════════════════════════════════════════════════
+#  WebDriver manager
+# ═══════════════════════════════════════════════════════════════
 
-    _driver_cache: Optional[webdriver.Firefox] = None
+def _resolve_geckodriver_path() -> Optional[str]:
+    env = (os.environ.get("GECKODRIVER") or os.environ.get("GECKODRIVER_PATH") or "").strip()
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return str(p)
+    which = shutil.which("geckodriver")
+    if which:
+        return which
+    return None
+
+
+class WebDriverManager:
     _driver_options_cache: Optional[Options] = None
+    _gecko_path_cache: Optional[str] = None
+    _lock = Lock()
+
+    _tl = local()
+    _drivers: set = set()
+    _drivers_lock = Lock()
+    _atexit_registered = False
 
     @classmethod
     def _get_cached_options(cls) -> Options:
-        """Get cached Firefox options to avoid recreating them."""
         if cls._driver_options_cache is None:
             options = Options()
             options.add_argument("--headless")
 
-            # Firefox-specific preferences
             prefs = {
-                "dom.webdriver.enabled": False,  # hide automation flag
-                "media.volume_scale": "0.0",     # mute audio
+                "dom.webdriver.enabled": False,
+                "media.volume_scale": "0.0",
+                "security.enterprise_roots.enabled": True,
+                "dom.security.https_only_mode": False,
+                "dom.security.https_only_mode_pbm": False,
+                "dom.webnotifications.enabled": False,
+                "dom.push.enabled": False,
+                "permissions.default.desktop-notification": 2,
+                "geo.enabled": False,
+                "browser.privatebrowsing.autostart": True,
+                "browser.cache.disk.enable": False,
+                "browser.cache.memory.enable": False,
+                "network.http.use-cache": False,
+                "dom.disable_open_during_load": True,
+                "dom.popup_maximum": 0,
+                "privacy.trackingprotection.enabled": True,
+                "browser.download.manager.showWhenStarting": False,
+                "browser.download.alwaysOpenPanel": False,
+                "browser.download.manager.useWindow": False,
+                "browser.helperApps.alwaysAsk.force": False,
+                "webdriver_accept_untrusted_certs": True,
+                "accept_untrusted_certs": True,
+                "assume_untrusted_cert_issuer": False,
             }
             for pref, value in prefs.items():
-                options.set_preference(pref, value)
+                try:
+                    options.set_preference(pref, value)
+                except Exception:
+                    pass
 
-            # Accept self-signed/invalid certs to avoid interstitials
-            options.set_capability("acceptInsecureCerts", True)
+            try:
+                options.set_capability("acceptInsecureCerts", True)
+            except Exception:
+                pass
 
             cls._driver_options_cache = options
-
         return cls._driver_options_cache
 
     @classmethod
-    def create_driver(cls, timeout: int = DEFAULT_TIMEOUT) -> webdriver.Firefox:
-        """Create configured Firefox WebDriver with caching."""
-        if cls._driver_cache is None:
-            options = cls._get_cached_options()
-
-            try:
-                service = FirefoxService(executable_path=GeckoDriverManager().install())
-                cls._driver_cache = webdriver.Firefox(service=service, options=options)
-                cls._driver_cache.set_page_load_timeout(timeout)
-
-                # Deterministic viewport
-                try:
-                    cls._driver_cache.set_window_size(1920, 1080)
-                except Exception:
-                    pass
-
-                # Anti-detection spoof for navigator.webdriver
-                try:
-                    cls._driver_cache.execute_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.error(f"Failed to create WebDriver: {e}")
-                sys.exit(1)
-
-        return cls._driver_cache
+    def _get_gecko_path(cls) -> str:
+        if cls._gecko_path_cache:
+            return cls._gecko_path_cache
+        with cls._lock:
+            if cls._gecko_path_cache:
+                return cls._gecko_path_cache
+            gecko_path = _resolve_geckodriver_path()
+            if gecko_path is None:
+                if GeckoDriverManager is None:
+                    raise RuntimeError("geckodriver not found in PATH and webdriver-manager is not installed")
+                gecko_path = GeckoDriverManager().install()
+            cls._gecko_path_cache = gecko_path
+            return gecko_path
 
     @classmethod
-    def cleanup_driver(cls) -> None:
-        """Clean up cached driver."""
-        if cls._driver_cache:
+    def warmup(cls) -> None:
+        """Pre-cache geckodriver path and options on the main thread
+        so worker threads don't all race to resolve them."""
+        cls._get_cached_options()
+        cls._get_gecko_path()
+
+    @classmethod
+    def create_driver(cls, timeout: int = DEFAULT_TIMEOUT) -> webdriver.Firefox:
+        d = getattr(cls._tl, "d", None)
+        if d is not None:
             try:
-                cls._driver_cache.quit()
+                _ = d.current_url
+                d.set_page_load_timeout(timeout)
+                try:
+                    d.set_script_timeout(timeout)
+                except Exception:
+                    pass
+                return d
+            except Exception:
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+                setattr(cls._tl, "d", None)
+
+        try:
+            options = cls._get_cached_options()
+            gecko_path = cls._get_gecko_path()
+
+            service = FirefoxService(executable_path=gecko_path)
+            d = webdriver.Firefox(service=service, options=options)
+            d.set_page_load_timeout(timeout)
+            try:
+                d.set_script_timeout(timeout)
             except Exception:
                 pass
-            cls._driver_cache = None
+
+            try:
+                d.set_window_size(1920, 1080)
+            except Exception:
+                pass
+
+            try:
+                d.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            except Exception:
+                pass
+
+            setattr(d, "_ng_nav", 0)
+            setattr(cls._tl, "d", d)
+            with cls._drivers_lock:
+                cls._drivers.add(d)
+
+            if not cls._atexit_registered:
+                cls._atexit_registered = True
+                atexit.register(cls.cleanup_all)
+
+            return d
+
+        except Exception as e:
+            logger.error(f"Failed to create WebDriver: {e}")
+            sys.exit(1)
+
+    @classmethod
+    def cleanup_all(cls) -> None:
+        """Quit every tracked browser instance.  Thread-safe."""
+        with cls._drivers_lock:
+            ds = list(cls._drivers)
+            cls._drivers.clear()
+        # Quit in parallel — each quit() can take a second or two
+        if len(ds) <= 1:
+            for d in ds:
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+        else:
+            def _q(d):
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+            with ThreadPoolExecutor(max_workers=len(ds)) as ex:
+                list(ex.map(_q, ds))
 
     @staticmethod
+    def _dom_has_meaningful_content(driver: webdriver.Firefox) -> bool:
+        try:
+            return bool(driver.execute_script("""
+                const b = document.body;
+                if (!b) return false;
+                const t = (b.innerText || "").trim();
+                if (t.length > 0) return true;
+                if (document.images && document.images.length > 0) return true;
+                if (document.querySelector("input,button,form,a,canvas,svg,video,iframe")) return true;
+                return (b.scrollHeight || 0) > 120;
+            """))
+        except Exception:
+            return False
+
+    @classmethod
+    def _maybe_reset_state(cls, driver: webdriver.Firefox) -> None:
+        try:
+            n = int(getattr(driver, "_ng_nav", 0)) + 1
+            setattr(driver, "_ng_nav", n)
+        except Exception:
+            n = 0
+        if not n or n % _BROWSER_RESET_EVERY != 0:
+            return
+        try:
+            driver.delete_all_cookies()
+        except Exception:
+            pass
+        try:
+            driver.execute_script("""
+                try { window.localStorage && localStorage.clear(); } catch(e) {}
+                try { window.sessionStorage && sessionStorage.clear(); } catch(e) {}
+            """)
+        except Exception:
+            pass
+        try:
+            driver.get("about:blank")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _dismiss_alert_if_present(driver: webdriver.Firefox) -> None:
+        try:
+            a = driver.switch_to.alert
+            try:
+                a.dismiss()
+            except Exception:
+                try:
+                    a.accept()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _stop_loading(driver: webdriver.Firefox) -> None:
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cap_fullpage_height(driver: webdriver.Firefox) -> Optional[Tuple[int, int]]:
+        try:
+            w = int(driver.execute_script("return Math.max(document.documentElement.clientWidth, window.innerWidth || 0) || 1920;"))
+            h = int(driver.execute_script("return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, 0) || 1080;"))
+            if h > _MAX_FULLPAGE_HEIGHT:
+                h = _MAX_FULLPAGE_HEIGHT
+            return w, h
+        except Exception:
+            return None
+
+    @staticmethod
+    def _try_bypass_firefox_interstitial(driver: webdriver.Firefox) -> None:
+        try:
+            cur = (driver.current_url or "").lower()
+            if not (cur.startswith("about:certerror") or cur.startswith("about:neterror")):
+                return  # Not an interstitial — skip entirely, no sleep
+            driver.execute_script("""
+                try {
+                    const adv = document.getElementById('advancedButton') || document.querySelector('#advancedButton');
+                    if (adv) adv.click();
+                    const cont = document.getElementById('exceptionDialogButton') || document.querySelector('#exceptionDialogButton');
+                    if (cont) cont.click();
+                } catch (e) {}
+            """)
+            time.sleep(0.25)
+        except Exception:
+            pass
+
+    @classmethod
     def capture_screenshot(
+        cls,
         driver: webdriver.Firefox,
         url: str,
-        follow_redirects: bool = False,  # retained for compatibility (labeling only)
+        follow_redirects: bool = False,
         timeout: int = DEFAULT_TIMEOUT,
-        full_page: bool = False
-    ) -> Tuple[bool, Optional[bytes], Optional[str], str]:
-        """Capture screenshot of a web page."""
+        full_page: bool = False,
+    ) -> Tuple[bool, Optional[bytes], str, str]:
+        """Capture a screenshot.
+
+        Returns (success, png_bytes, final_url, page_title).
+        """
+        png_data: Optional[bytes] = None
         try:
-            driver.get(url)
-
-            # Smart wait configuration
-            js_wait_time = min(max(timeout // 4, 3), 15)
-
-            # Initial wait for basic page load
-            time.sleep(2)
-
-            # Optimized waiting strategy
             try:
-                # Wait for document ready state
-                WebDriverWait(driver, js_wait_time).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
+                driver.get(url)
+            except TimeoutException:
+                cls._stop_loading(driver)
 
-                # Wait for Angular apps (non-blocking)
-                try:
-                    driver.execute_script(
-                        "return typeof window.getAllAngularTestabilities === 'undefined' || "
-                        "window.getAllAngularTestabilities().every(function(t) { return t.isStable(); })"
-                    )
-                except Exception:
-                    pass  # Not Angular or timeout
+            time.sleep(0.35)
+            cls._try_bypass_firefox_interstitial(driver)
 
-                # Wait for some meaningful content (don’t be too strict)
+            js_wait_time = min(max(timeout // 4, 3), 15)
+            try:
                 WebDriverWait(driver, js_wait_time).until(
-                    lambda d: len(d.find_element(By.TAG_NAME, "body").text.strip()) >= 0
+                    lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
                 )
             except TimeoutException:
-                # Fallback wait
-                time.sleep(min(js_wait_time, 5))
+                pass
 
-            body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
-            if len(body_text) < 50 and len(driver.page_source) < 1000:
-                tqdm.write(f"Warning: {url} appears to have minimal content after {js_wait_time}s wait")
+            try:
+                WebDriverWait(driver, min(js_wait_time, 6)).until(
+                    lambda d: cls._dom_has_meaningful_content(d)
+                )
+            except TimeoutException:
+                pass
 
-            final_url = driver.current_url if follow_redirects else url
-            if full_page and hasattr(driver, "get_full_page_screenshot_as_png"):
-                png_data = driver.get_full_page_screenshot_as_png()
-            else:
-                png_data = driver.get_screenshot_as_png()
+            page_title = ""
+            try:
+                page_title = (driver.title or "").strip()
+            except Exception:
+                pass
 
-            base64_data = base64.b64encode(png_data).decode('utf-8')
+            final_url = url
+            try:
+                if follow_redirects:
+                    final_url = driver.current_url or url
+            except Exception:
+                pass
 
-            return True, png_data, base64_data, final_url
+            if full_page:
+                dims = cls._cap_fullpage_height(driver)
+                if dims:
+                    w, h = dims
+                    old = None
+                    try:
+                        old_w = int(driver.execute_script("return window.innerWidth;"))
+                        old_h = int(driver.execute_script("return window.innerHeight;"))
+                        old = (old_w, old_h)
+                    except Exception:
+                        pass
+                    try:
+                        driver.set_window_size(w, h)
+                    except Exception:
+                        pass
+                    if hasattr(driver, "get_full_page_screenshot_as_png"):
+                        try:
+                            png_data = driver.get_full_page_screenshot_as_png()
+                        except Exception:
+                            png_data = None
+                    if old:
+                        try:
+                            driver.set_window_size(old[0], old[1])
+                        except Exception:
+                            pass
 
-        except WebDriverException as e:
-            tqdm.write(f"WebDriver error for {url}: {e}")
-            return False, None, None, url
+            if png_data is None:
+                try:
+                    png_data = driver.get_screenshot_as_png()
+                except UnexpectedAlertPresentException:
+                    cls._dismiss_alert_if_present(driver)
+                    png_data = driver.get_screenshot_as_png()
+
+            if not png_data:
+                return False, None, url, ""
+
+            return True, png_data, final_url, page_title
+
+        except (WebDriverException, NoSuchWindowException) as e:
+            logger.debug(f"WebDriver error for {url}: {e}")
+            return False, None, url, ""
         except Exception as e:
-            tqdm.write(f"Failed to capture screenshot for {url}: {e}")
-            return False, None, None, url
+            logger.debug(f"Failed to capture screenshot for {url}: {e}")
+            return False, None, url, ""
+        finally:
+            try:
+                cls._maybe_reset_state(driver)
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Streaming capture engine
+# ═══════════════════════════════════════════════════════════════
+#
+#  This is a GENERATOR.  It yields results in-order while printing
+#  console discovery lines IMMEDIATELY as each capture completes
+#  (even if out-of-order).  This gives real-time feedback during
+#  the capture phase instead of the old "burst-at-the-end" pattern.
+#
+
+def _build_url(host: str, port: int, scheme: str) -> str:
+    host_for_url = f"[{host}]" if is_ipv6(host) else host
+    is_standard_port = (port == 80 and scheme == 'http') or (port == 443 and scheme == 'https')
+    return f"{scheme}://{host_for_url}" if is_standard_port else f"{scheme}://{host_for_url}:{port}"
+
+
+# Result dict keys for clarity
+_R_URL     = "url"
+_R_OK      = "ok"
+_R_PNG     = "png"
+_R_FINAL   = "final_url"
+_R_TITLE   = "title"
+_R_TAGS    = "tags"
+_R_SCHEME  = "scheme"
+_R_HOST    = "host"
+_R_PORT    = "port"
+
+
+def _stream_captures(
+    host_port_list: List[Tuple[str, int, str]],
+    progress_bar: tqdm,
+    follow_redirects: bool,
+    timeout: int,
+    full_page: bool,
+) -> Iterator[Dict]:
+    """Generator: yields one dict per URL **in order**, while printing
+    console discovery lines immediately as each capture finishes."""
+
+    total = len(host_port_list)
+    if total == 0:
+        return
+
+    cpu = os.cpu_count() or 2
+    # Cap workers: at most _MAX_SHOT_WORKERS, at most half CPUs, at most #targets
+    workers = min(_MAX_SHOT_WORKERS, max(1, cpu // 2), total)
+
+    # Pre-warm geckodriver + options on main thread to avoid all workers
+    # racing to resolve the path simultaneously (the pre-capture stall).
+    WebDriverManager.warmup()
+
+    def _task(idx: int, host: str, port: int, scheme: str, url: str) -> Dict:
+        d = WebDriverManager.create_driver(timeout)
+        ok, png, final_url, title = WebDriverManager.capture_screenshot(
+            d, url, follow_redirects, timeout, full_page
+        )
+        tags = _detect_tags(title, url=url, final_url=final_url) if (ok and png) else []
+        return {
+            "idx": idx, _R_HOST: host, _R_PORT: port, _R_SCHEME: scheme,
+            _R_URL: url, _R_OK: bool(ok and png), _R_PNG: png,
+            _R_FINAL: final_url, _R_TITLE: title, _R_TAGS: tags,
+        }
+
+    it = iter(enumerate(host_port_list))
+    in_flight: Dict[object, int] = {}  # future -> idx
+    buf: Dict[int, Dict] = {}          # idx -> result
+    next_yield = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+
+        def _submit() -> bool:
+            try:
+                i, (host, port, scheme) = next(it)
+                url = _build_url(host, port, scheme)
+                fut = ex.submit(_task, i, host, port, scheme, url)
+                in_flight[fut] = i
+                return True
+            except StopIteration:
+                return False
+
+        # Seed the pool
+        for _ in range(workers):
+            if not _submit():
+                break
+
+        while in_flight:
+            done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+
+            for fut in done:
+                idx_fallback = in_flight.pop(fut)
+                progress_bar.update(1)
+
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = {
+                        "idx": idx_fallback,
+                        _R_URL: "(unknown)", _R_OK: False, _R_PNG: None,
+                        _R_FINAL: "", _R_TITLE: "", _R_TAGS: [],
+                        _R_SCHEME: "", _R_HOST: "", _R_PORT: 0,
+                    }
+
+                # ── Live console line (IMMEDIATELY, even out-of-order) ──
+                url_display = res[_R_URL]
+                counter = _c_dim(f"[{res['idx']+1}/{total}]")
+
+                if res[_R_OK]:
+                    title_str = f'"{_truncate(res[_R_TITLE])}"' if res[_R_TITLE] else _c_dim("(no title)")
+                    tag_str = "  " + " ".join(f"[{t}]" for t in res[_R_TAGS]) if res[_R_TAGS] else ""
+                    redir = f"  -> {res[_R_FINAL]}" if res[_R_FINAL] != url_display else ""
+                    _twrite(f" {_c_green('>>')} {counter} {url_display:<40} {title_str}{tag_str}{redir}")
+                else:
+                    _twrite(f" {_c_red('!!')} {counter} {url_display:<40} {_c_red('capture failed')}")
+
+                buf[res["idx"]] = res
+
+                # Submit replacement work right away to keep the pool full
+                _submit()
+
+            # Yield results in order (file output must be ordered)
+            while next_yield in buf:
+                yield buf.pop(next_yield)
+                next_yield += 1
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Document generator
+# ═══════════════════════════════════════════════════════════════
+
+_HTML_HEADER = """<!DOCTYPE html><html lang="en"><head><title>NetGazer Scan Report</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>
+* {{ box-sizing: border-box; }} body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; margin: 0; padding: 24px; color: #1f2937; }}
+.header {{ text-align: center; margin: 0 auto 14px; max-width: 1400px; padding: 24px; background: #fff; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }} .header h1 {{ margin: 0 0 10px; font-size: 22px; font-weight: 700; }}
+.meta {{ color: #6b7280; font-size: 13px; line-height: 1.7; }} .meta b {{ color: #374151; font-weight: 600; }}
+.toolbar {{ margin: 0 auto 10px; max-width: 1400px; display: grid; gap: 10px; }} .toolbar input {{ width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; outline: none; background: #fff; transition: border .15s; }}
+.toolbar input:focus {{ border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }}
+.tagbar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+.tagbtn {{ border: 1px solid #d1d5db; background: #fff; color: #374151; padding: 6px 10px; border-radius: 999px; font-size: 12px; cursor: pointer; user-select: none; }}
+.tagbtn.active {{ border-color: #111827; color: #111827; box-shadow: 0 0 0 3px rgba(17,24,39,.08); }}
+.tagbtn .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 999px; margin-right: 6px; vertical-align: middle; }} .status {{ color: #6b7280; font-size: 12px; }}
+table {{ margin: 0 auto; border-collapse: collapse; width: 100%; max-width: 1400px; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+thead {{ background: #f9fafb; }} th {{ font-weight: 600; text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #6b7280; padding: 12px 16px; border-bottom: 2px solid #e5e7eb; }}
+td {{ padding: 14px 16px; vertical-align: top; border-bottom: 1px solid #f3f4f6; }} td:first-child {{ width: 320px; min-width: 240px; }}
+.url-cell {{ font-size: 13px; line-height: 1.5; }} .url-link {{ color: #2563eb; text-decoration: none; word-break: break-all; font-weight: 500; }} .url-link:hover {{ text-decoration: underline; }}
+.scheme-http {{ display: inline-block; font-size: 9px; font-weight: 700; color: #dc2626; background: #fef2f2; padding: 1px 5px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }}
+.scheme-https {{ display: inline-block; font-size: 9px; font-weight: 700; color: #16a34a; background: #f0fdf4; padding: 1px 5px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }}
+.page-title {{ color: #6b7280; font-size: 12px; margin-top: 5px; }} .page-title em {{ font-style: italic; }}
+.redirect {{ color: #9ca3af; font-size: 11px; margin-top: 3px; word-break: break-all; }}
+.tag {{ display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; margin-top: 6px; margin-right: 3px; color: #fff; text-transform: uppercase; letter-spacing: .3px; }}
+img {{ max-width: 100%; height: auto; border-radius: 6px; cursor: zoom-in; display: block; transition: opacity .2s; }}
+.footer {{ text-align: center; margin: 20px auto 0; max-width: 1400px; padding: 16px; color: #9ca3af; font-size: 12px; }}
+details {{ max-width: 1400px; margin: 12px auto 0; background: #fff; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.08); padding: 10px 14px; }}
+summary {{ cursor: pointer; color: #374151; font-weight: 600; }} pre {{ white-space: pre-wrap; word-break: break-all; color: #6b7280; font-size: 12px; margin: 10px 0 0; }}
+#overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,.92); z-index: 1000; cursor: zoom-out; justify-content: center; align-items: center; }}
+#overlay img {{ max-width: 95%; max-height: 95%; object-fit: contain; }}
+@media print {{ .toolbar, #overlay, details {{ display: none !important; }} body {{ background: #fff; padding: 0; }} table {{ box-shadow: none; }} img {{ cursor: default; }} }}
+</style></head><body>
+<div class="header"><h1>NetGazer Scan Report</h1><div class="meta">{meta_html}</div></div>
+<div class="toolbar"><input type="text" id="filterInput" onkeyup="filterRows()" placeholder="Filter by URL, title, or tag..."><div class="tagbar" id="tagBar">{tagbar_html}<span class="status" id="statusLine"></span></div></div>
+<table><thead><tr><th>Web Server</th><th>Screenshot</th></tr></thead><tbody id="tbody">
+"""
+
+_HTML_FOOTER = """</tbody></table>
+{failed_block}
+<div class="footer">{footer_html}</div>
+<div id="overlay" onclick="closeZoom()"><img id="zoomedImg" alt="Zoomed screenshot"></div>
+<script>
+let activeTag = "";
+function zoom(img){{ document.getElementById('zoomedImg').src = img.src; document.getElementById('overlay').style.display = 'flex'; }}
+function closeZoom(){{ document.getElementById('overlay').style.display = 'none'; }}
+document.addEventListener('keydown', function(e){{ if (e.key === 'Escape') closeZoom(); }});
+function setTag(tag){{ if (activeTag === tag){{ activeTag = ""; }} else {{ activeTag = tag; }}
+document.querySelectorAll('.tagbtn').forEach(btn => {{ btn.classList.toggle('active', btn.dataset.tag === activeTag); }}); filterRows(); }}
+function filterRows(){{ const term = (document.getElementById('filterInput').value || "").toLowerCase();
+const rows = document.querySelectorAll('#tbody tr'); let shown = 0; rows.forEach(row => {{
+const hay = (row.dataset.search || ""); const tags = (row.dataset.tags || "");
+const okTerm = !term || hay.includes(term); const okTag = !activeTag || tags.split(',').includes(activeTag);
+const show = okTerm && okTag; row.style.display = show ? '' : 'none'; if (show) shown++; }});
+document.getElementById('statusLine').textContent = `Showing ${{shown}} / ${{rows.length}}`; }}
+filterRows();
+</script></body></html>"""
 
 
 class DocumentGenerator:
-    """Handles document generation in HTML and DOCX formats."""
-
-    # HTML template as class constant for better performance
-    HTML_TEMPLATE = """<html>
-<head>
-  <title>Web Server Screenshots</title>
-  <meta charset='UTF-8'>
-  <style>
-    body {{ font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; color: #333; }}
-    h1 {{ text-align: center; margin-bottom: 30px; }}
-    table {{ 
-      margin: 0 auto; 
-      border-collapse: collapse; 
-      width: 90%; 
-      max-width: 1200px; 
-      box-shadow: 0 2px 5px rgba(0,0,0,0.15); 
-      table-layout: fixed;
-    }}
-    th, td {{ 
-      border: 1px solid #ccc; 
-      padding: 12px; 
-      text-align: center; 
-      vertical-align: top;
-    }}
-    th {{ background-color: #e0e0e0; }}
-    tr:nth-child(even) {{ background-color: #fafafa; }}
-    th:first-child, td:first-child {{ 
-      width: 25%; 
-      min-width: 200px; 
-      max-width: 300px;
-    }}
-    th:last-child, td:last-child {{ width: 75%; }}
-    .url-text {{ 
-      word-wrap: break-word; 
-      word-break: break-all; 
-      overflow-wrap: break-word; 
-      hyphens: auto; 
-      line-height: 1.4; 
-      font-size: 12px; 
-      text-align: left; 
-      padding: 8px;
-    }}
-    img {{ 
-      max-width: 100%; 
-      height: auto; 
-      border-radius: 5px; 
-      display: block; 
-      margin: 0 auto;
-    }}
-    @media (max-width: 768px) {{
-      table {{ width: 100%; }}
-      th:first-child, td:first-child {{ width: 30%; }}
-      th:last-child, td:last-child {{ width: 70%; }}
-      .url-text {{ font-size: 10px; }}
-    }}
-  </style>
-</head>
-<body>
-  <h1>Web Server Screenshots</h1>
-  <table>
-    <tr><th>Web Request Info</th><th>Web Screenshot</th></tr>
-{rows}
-  </table>
-</body>
-</html>"""
 
     @staticmethod
     def build_url(host: str, port: int, scheme: str) -> str:
-        """Build clean URL from components, wrapping IPv6 in [] as needed."""
-        host_for_url = f"[{host}]" if is_ipv6(host) else host
-        is_standard_port = (port == 80 and scheme == 'http') or (port == 443 and scheme == 'https')
-        return f"{scheme}://{host_for_url}" if is_standard_port else f"{scheme}://{host_for_url}:{port}"
+        return _build_url(host, port, scheme)
 
-    @staticmethod
-    def _process_screenshot_batch(
-        driver: webdriver.Firefox,
-        host_port_batches: List[Tuple[str, int, str]],
-        progress_bar: tqdm,
-        follow_redirects: bool,
-        timeout: int,
-        full_page: bool
-    ) -> List[Tuple[str, str]]:
-        """Process a batch of screenshots and return results."""
-        items = []
-
-        for host, port, scheme in host_port_batches:
-            url = DocumentGenerator.build_url(host, port, scheme)
-
-            success, _, b64_data, final_url = WebDriverManager.capture_screenshot(
-                driver, url, follow_redirects, timeout, full_page
-            )
-
-            if success and b64_data:
-                display_text = url if url == final_url else f"{url} → {final_url}"
-                items.append((display_text, b64_data))
-                whisper_winds(f"Successfully captured {url}" +
-                              (f" (redirected to {final_url})" if url != final_url else ""))
-
-            progress_bar.update(1)
-
-        return items
+    # ───────────────────────── HTML ─────────────────────────
 
     @classmethod
     def generate_html(
         cls,
-        driver: webdriver.Firefox,
         output_file: str,
         hosts_to_capture: List[Tuple[str, List[Tuple[int, str]]]],
         progress_bar: tqdm,
         follow_redirects: bool = False,
         timeout: int = DEFAULT_TIMEOUT,
-        full_page: bool = False
-    ) -> None:
-        """Generate HTML document with screenshots."""
-        # Flatten host/port combinations for batch processing
-        host_port_batches = [
+        full_page: bool = False,
+        scan_meta: Optional[Dict] = None
+    ) -> Tuple[int, int, Counter, List[str]]:
+
+        meta = scan_meta or {}
+        host_port_list: List[Tuple[str, int, str]] = [
             (host, port, scheme)
             for host, port_scheme_list in hosts_to_capture
             for port, scheme in port_scheme_list
         ]
 
-        items = cls._process_screenshot_batch(
-            driver, host_port_batches, progress_bar, follow_redirects, timeout, full_page
-        )
+        failures: List[str] = []
+        captured_n = 0
+        tag_counter: Counter = Counter()
 
-        # Generate HTML content
-        rows = [
-            f"    <tr><td><span class='url-text'>{url}</span></td>"
-            f"<td><img src='data:image/png;base64,{b64}' alt='Screenshot of {url}'></td></tr>"
-            for url, b64 in items
-        ]
+        # Partial metadata (counts filled in later)
+        meta_parts_pre = []
+        if meta.get("timestamp"):
+            meta_parts_pre.append(f"<b>Date:</b> {html.escape(str(meta['timestamp']))}")
+        if meta.get("total_hosts"):
+            meta_parts_pre.append(f"<b>Targets:</b> {int(meta['total_hosts'])} hosts")
+        if meta.get("ports"):
+            meta_parts_pre.append(f"<b>Ports:</b> {html.escape(', '.join(map(str, meta['ports'])))}")
 
-        html_content = cls.HTML_TEMPLATE.format(rows='\n'.join(rows))
+        # Stream rows to a temp file as they arrive (memory-efficient)
+        rows_tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".rows.html")
+        rows_tmp_path = Path(rows_tmp.name)
 
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(html_content)
+            # ── Stream captures, writing each row immediately ──
+            for r in _stream_captures(host_port_list, progress_bar, follow_redirects, timeout, full_page):
+                if r[_R_OK] and r[_R_PNG]:
+                    tags = r[_R_TAGS]
+                    for t in tags:
+                        tag_counter[t] += 1
+
+                    b64_data = ""
+                    try:
+                        b64_data = base64.b64encode(r[_R_PNG]).decode('utf-8')
+                    except Exception:
+                        b64_data = ""
+
+                    url = r[_R_URL]
+                    final_url = r[_R_FINAL]
+                    title = r[_R_TITLE]
+                    scheme = r[_R_SCHEME]
+
+                    safe_url_attr = html.escape(url, quote=True)
+                    safe_url_text = html.escape(url)
+                    safe_final = html.escape(final_url, quote=True)
+                    search_blob = (f"{url} {title} {' '.join(tags)}").lower()
+                    safe_search = html.escape(search_blob, quote=True)
+                    safe_tags_attr = html.escape(",".join(tags), quote=True)
+
+                    scheme_badge = ('<span class="scheme-https">HTTPS</span>'
+                                    if scheme == "https"
+                                    else '<span class="scheme-http">HTTP</span>')
+                    link = f'<a href="{safe_url_attr}" target="_blank" rel="noopener" class="url-link">{safe_url_text}</a>'
+
+                    cell_parts = [f'{scheme_badge}{link}']
+                    if title:
+                        cell_parts.append(f'<div class="page-title"><em>{html.escape(_truncate(title))}</em></div>')
+                    if final_url != url:
+                        cell_parts.append(f'<div class="redirect">→ {safe_final}</div>')
+                    if tags:
+                        badge_html = " ".join(
+                            f'<span class="tag" style="background:{_TAG_BADGE_COLORS.get(t, "#6b7280")}">{html.escape(t)}</span>'
+                            for t in tags
+                        )
+                        cell_parts.append(badge_html)
+
+                    url_cell = f'<td class="url-cell">{"".join(cell_parts)}</td>'
+                    img_cell = (
+                        f'<td><img src="data:image/png;base64,{b64_data}" alt="Screenshot of {safe_url_text}" '
+                        f'loading="lazy" decoding="async" onclick="zoom(this)"></td>'
+                    )
+                    rows_tmp.write(f'    <tr data-search="{safe_search}" data-tags="{safe_tags_attr}">{url_cell}{img_cell}</tr>\n')
+                    captured_n += 1
+                else:
+                    failures.append(r[_R_URL])
+
+            rows_tmp.close()
+
+        except Exception:
+            try:
+                rows_tmp.close()
+            except Exception:
+                pass
+            raise
+
+        # ── Assemble final HTML ──
+        total_n = len(host_port_list)
+        failed_n = len(failures)
+
+        meta_parts2 = list(meta_parts_pre)
+        meta_parts2.append(f"<b>Captured:</b> {captured_n}/{total_n} screenshots")
+        if failed_n:
+            meta_parts2.append(f"<b style='color:#dc2626'>Failed:</b> {failed_n}")
+        if tag_counter:
+            tag_summary = ", ".join(f"{cnt}× {tag}" for tag, cnt in tag_counter.most_common())
+            meta_parts2.append(f"<b>Flagged:</b> {html.escape(tag_summary)}")
+        meta_html = " &nbsp;|&nbsp; ".join(meta_parts2)
+
+        tagbar_parts = []
+        if tag_counter:
+            tagbar_parts.append('<span class="tagbtn active" data-tag="" onclick="setTag(\'\')">All</span>')
+            for tag, cnt in tag_counter.most_common():
+                color = _TAG_BADGE_COLORS.get(tag, "#6b7280")
+                tagbar_parts.append(
+                    f'<span class="tagbtn" data-tag="{html.escape(tag)}" onclick="setTag(\'{html.escape(tag)}\')">'
+                    f'<span class="dot" style="background:{color}"></span>{html.escape(tag)} ({cnt})</span>'
+                )
+        tagbar_html = "\n".join(tagbar_parts)
+
+        footer_parts = [f"Generated by NetGazer — {captured_n} screenshots captured"]
+        if failed_n:
+            footer_parts.append(f"{failed_n} failed")
+        footer_html = " | ".join(footer_parts)
+
+        failed_block = ""
+        if failures:
+            failed_block = (
+                f"<details><summary>Failed URLs ({len(failures)})</summary>"
+                f"<pre>{html.escape(chr(10).join(failures))}</pre></details>"
+            )
+
+        out_path = Path(output_file)
+        tmp_out = out_path.with_suffix(out_path.suffix + ".tmp")
+        try:
+            with tmp_out.open("w", encoding="utf-8") as out:
+                out.write(_HTML_HEADER.format(meta_html=meta_html, tagbar_html=tagbar_html))
+                with rows_tmp_path.open("r", encoding="utf-8") as rf:
+                    shutil.copyfileobj(rf, out)
+                out.write(_HTML_FOOTER.format(failed_block=failed_block, footer_html=footer_html))
+            _atomic_replace(tmp_out, out_path)
         except IOError as e:
             logger.error(f"Failed to write HTML file {output_file}: {e}")
             sys.exit(1)
+        finally:
+            for p in (rows_tmp_path, tmp_out):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        return captured_n, failed_n, tag_counter, failures
+
+    # ───────────────────────── DOCX ─────────────────────────
 
     @staticmethod
     def generate_docx(
-        driver: webdriver.Firefox,
         output_file: str,
         hosts_to_capture: List[Tuple[str, List[Tuple[int, str]]]],
         progress_bar: tqdm,
         follow_redirects: bool = False,
         timeout: int = DEFAULT_TIMEOUT,
-        full_page: bool = False
-    ) -> None:
-        """Generate DOCX document with screenshots."""
-        try:
-            doc = docx.Document()
+        full_page: bool = False,
+        scan_meta: Optional[Dict] = None
+    ) -> Tuple[int, int, Counter, List[str]]:
 
-            # Add title
+        captured = 0
+        failed = 0
+        tag_counter: Counter = Counter()
+        failure_urls: List[str] = []
+
+        host_port_list: List[Tuple[str, int, str]] = [
+            (host, port, scheme)
+            for host, port_scheme_list in hosts_to_capture
+            for port, scheme in port_scheme_list
+        ]
+
+        meta = scan_meta or {}
+        out_path = Path(output_file)
+        tmp_out = out_path.with_suffix(out_path.suffix + ".tmp")
+
+        try:
+            doc = docx.Document()  # type: ignore[union-attr]
+
             title_paragraph = doc.add_paragraph()
             title_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
             title_run = title_paragraph.add_run("Web Server Screenshots")
             title_run.bold = True
             title_run.font.size = Pt(24)
+
+            meta_parts = []
+            if meta.get("timestamp"):
+                meta_parts.append(f"Date: {meta['timestamp']}")
+            if meta.get("total_hosts"):
+                meta_parts.append(f"Targets: {meta['total_hosts']} hosts")
+            if meta.get("ports"):
+                meta_parts.append(f"Ports: {', '.join(map(str, meta['ports']))}")
+            if meta_parts:
+                meta_para = doc.add_paragraph()
+                meta_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                meta_run = meta_para.add_run(" | ".join(meta_parts))
+                meta_run.font.size = Pt(9)
+                meta_run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+
             doc.add_paragraph("")
 
-            # Create table
             table = doc.add_table(rows=1, cols=2)
-            table.style = 'Light Grid Accent 1'
+            try:
+                table.style = 'Light Grid Accent 1'
+            except Exception:
+                try:
+                    table.style = 'Table Grid'
+                except Exception:
+                    pass
             table.autofit = False
+            table.columns[0].width = Inches(2.0)
+            table.columns[1].width = Inches(4.0)
 
-            # Set column widths
-            table.columns[0].width = Inches(2.0)  # URL column
-            table.columns[1].width = Inches(4.0)  # Image column
-
-            # Set header
             hdr_cells = table.rows[0].cells
             hdr_cells[0].text = 'Web Request Info'
             hdr_cells[1].text = 'Web Screenshot'
-
             for cell in hdr_cells:
                 cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
                 cell.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
 
-            # Add screenshots
-            for host, port_scheme_list in hosts_to_capture:
-                for port, scheme in port_scheme_list:
-                    url = DocumentGenerator.build_url(host, port, scheme)
+            # ── Stream captures, adding rows as they arrive ──
+            for r in _stream_captures(host_port_list, progress_bar, follow_redirects, timeout, full_page):
+                if not r[_R_OK] or not r[_R_PNG]:
+                    failed += 1
+                    failure_urls.append(r[_R_URL])
+                    continue
 
-                    success, png_data, _, final_url = WebDriverManager.capture_screenshot(
-                        driver, url, follow_redirects, timeout, full_page
-                    )
+                tags = r[_R_TAGS]
+                for t in tags:
+                    tag_counter[t] += 1
 
-                    if not success or not png_data:
-                        progress_bar.update(1)
-                        continue
+                url = r[_R_URL]
+                final_url = r[_R_FINAL]
+                title = r[_R_TITLE]
 
-                    # Add table row
-                    row_cells = table.add_row().cells
-                    url_cell = row_cells[0]
+                row_cells = table.add_row().cells
+                url_cell = row_cells[0]
+                url_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
 
-                    display_text = url if url == final_url else f"{url} → {final_url}"
-                    url_cell.text = display_text
-                    url_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-                    url_cell.paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+                url_para = url_cell.paragraphs[0]
+                url_para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+                url_run = url_para.add_run(url)
+                url_run.font.size = Pt(9)
 
-                    # Add screenshot - optimize BytesIO usage
-                    with BytesIO(png_data) as img_buf:
-                        pic_run = row_cells[1].paragraphs[0].add_run()
-                        pic_run.add_picture(img_buf, width=Inches(4.0))
+                if final_url != url:
+                    redir_para = url_cell.add_paragraph()
+                    redir_run = redir_para.add_run(f"→ {final_url}")
+                    redir_run.font.size = Pt(8)
+                    redir_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
 
-                    whisper_winds(f"Successfully captured {url}" +
-                                  (f" (redirected to {final_url})" if url != final_url else ""))
-                    progress_bar.update(1)
+                if title:
+                    title_para = url_cell.add_paragraph()
+                    t_run = title_para.add_run(f'"{_truncate(title)}"')
+                    t_run.italic = True
+                    t_run.font.size = Pt(8)
+                    t_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
-            # Add footer
+                if tags:
+                    tag_para = url_cell.add_paragraph()
+                    tag_run = tag_para.add_run(f'[{", ".join(tags)}]')
+                    tag_run.bold = True
+                    tag_run.font.size = Pt(8)
+                    tag_run.font.color.rgb = RGBColor(0xCC, 0x55, 0x00)
+
+                with BytesIO(r[_R_PNG]) as img_buf:
+                    pic_run = row_cells[1].paragraphs[0].add_run()
+                    pic_run.add_picture(img_buf, width=Inches(4.0))
+
+                captured += 1
+
+            if failure_urls:
+                doc.add_page_break()
+                p = doc.add_paragraph("Failed URLs")
+                if p.runs:
+                    p.runs[0].bold = True
+                for u in failure_urls:
+                    try:
+                        doc.add_paragraph(u, style='List Bullet')
+                    except Exception:
+                        doc.add_paragraph(f"- {u}")
+
             section = doc.sections[0]
             footer = section.footer
-            footer_paragraph = footer.paragraphs[0]
-            footer_paragraph.text = "Generated by NetGazer"
+            if footer.paragraphs:
+                footer_paragraph = footer.paragraphs[0]
+            else:
+                footer_paragraph = footer.add_paragraph()
+            footer_parts = ["Generated by NetGazer"]
+            if meta.get("timestamp"):
+                footer_parts.append(meta["timestamp"])
+            footer_parts.append(f"{captured} screenshots")
+            footer_paragraph.text = " | ".join(footer_parts)
             footer_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
 
-            doc.save(output_file)
+            doc.save(str(tmp_out))
+            _atomic_replace(tmp_out, out_path)
 
         except Exception as e:
             logger.error(f"Failed to generate DOCX file {output_file}: {e}")
-            sys.exit(1)
+            _twrite(f" {_c_red('!!')} DOCX generation error: {e}")
+            try:
+                if tmp_out.exists():
+                    tmp_out.unlink()
+            except Exception:
+                pass
 
+        return captured, failed, tag_counter, failure_urls
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLI parsing helpers
+# ═══════════════════════════════════════════════════════════════
 
 def comma_separated_ints(value: str) -> List[int]:
-    """Parse comma-separated port list with validation."""
     try:
         ports = [int(p.strip()) for p in value.split(',') if p.strip()]
         if not ports:
@@ -736,26 +1450,24 @@ def comma_separated_ints(value: str) -> List[int]:
         if invalid_ports:
             raise ValueError(f"Ports out of valid range (1-65535): {invalid_ports}")
 
-        return sorted(set(ports))  # Remove duplicates and sort
+        return sorted(set(ports))
     except ValueError as e:
         raise argparse.ArgumentTypeError(f"Invalid port specification: {e}")
 
 
-def check_dependencies() -> None:
-    """Check for required libraries with detailed error messages."""
-    required_libs = {
-        'selenium': 'selenium',
-        'docx': 'python-docx',
-        'webdriver_manager': 'webdriver-manager',
-        'tqdm': 'tqdm'
-    }
+def check_dependencies(output_file: str) -> None:
     missing = []
+    if webdriver is None:
+        missing.append("selenium")
+    if tqdm is None:
+        missing.append("tqdm")
 
-    for import_name, package_name in required_libs.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(package_name)
+    out_suffix = Path(output_file).suffix.lower()
+    if out_suffix == ".docx" and docx is None:
+        missing.append("python-docx")
+
+    if _resolve_geckodriver_path() is None and GeckoDriverManager is None:
+        missing.append("webdriver-manager")
 
     if missing:
         print(f"Missing required libraries: {', '.join(missing)}")
@@ -763,104 +1475,91 @@ def check_dependencies() -> None:
         sys.exit(1)
 
 
-def initial_checks() -> None:
-    """Perform comprehensive initial system checks."""
-    # Check if running as root (Unix-like systems)
+def initial_checks(output_file: str) -> None:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
-        print("Run as a regular user, not root.")
-        sys.exit(1)
-
-    # Check write permissions in current directory
-    test_file = Path.cwd() / "temp_test_file"
-    try:
-        test_file.write_text("test")
-        test_file.unlink()
-    except (IOError, OSError, PermissionError):
-        print("No write permissions in current directory.")
-        sys.exit(1)
-
-    # Check dependencies
-    check_dependencies()
+        print(f"  {_c_yellow('[!]')} Running as root — browser may behave unexpectedly")
+    check_dependencies(output_file)
 
 
-def whisper_winds(text: str) -> None:
-    """Print colored success message with ANSI codes."""
-    tqdm.write(f"\033[92m{text}\033[0m")
-
-
-def expand_hosts(hosts: List[str]) -> List[str]:
-    """Expand network ranges in host list with deduplication (correct /31, /127)."""
-    expanded_hosts = []
-    seen = set()
-
-    for host in hosts:
-        # First, try exact IP; if so, just add it
-        try:
-            ipaddress.ip_address(host)
-            if host not in seen:
-                expanded_hosts.append(host)
-                seen.add(host)
-            continue
-        except ValueError:
-            pass
-
-        # Next, try network
-        try:
-            network = ipaddress.ip_network(host, strict=False)
-            if network.num_addresses == 1:
-                ip_str = str(network.network_address)
-                if ip_str not in seen:
-                    expanded_hosts.append(ip_str)
-                    seen.add(ip_str)
-            else:
-                for ip in network.hosts():
-                    ip_str = str(ip)
-                    if ip_str not in seen:
-                        expanded_hosts.append(ip_str)
-                        seen.add(ip_str)
-            continue
-        except ValueError:
-            pass
-
-        # Else treat as hostname
-        if host not in seen:
-            expanded_hosts.append(host)
-            seen.add(host)
-
-    return expanded_hosts
-
+# ═══════════════════════════════════════════════════════════════
+#  Scan phases
+# ═══════════════════════════════════════════════════════════════
 
 def perform_port_scan(hosts: List[str], ports: List[int]) -> List[Tuple[str, List[Tuple[int, str]]]]:
-    """Perform optimized port scanning on all hosts."""
-    hosts_to_capture = []
-
-    print(f"Starting optimized port scan on {len(hosts)} host(s) with ports {ports}...")
-
-    # Deterministic ordering: preserve host order from input list
     host_order = {h: i for i, h in enumerate(hosts)}
     ordered_results: List[Tuple[int, Tuple[str, List[Tuple[int, str]]]]] = []
 
-    with tqdm(total=len(hosts), unit='host', desc="Port scanning", leave=False) as pbar:
-        with ThreadPoolExecutor(max_workers=MAX_PORT_WORKERS) as executor:
-            futures = {
-                executor.submit(PortScanner.scan_host, host, ports, pbar): host
-                for host in hosts
-            }
+    t0 = time.perf_counter()
+    max_workers = min(MAX_PORT_WORKERS, max(1, len(hosts)))
 
-            for future in as_completed(futures):
-                host = futures[future]
+    with tqdm(total=len(hosts), unit='host', desc="  Port scan", leave=False) as pbar:  # type: ignore[union-attr]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            it = iter(hosts)
+            in_flight: Dict[object, str] = {}
+
+            def _submit(h: str) -> None:
+                fut = executor.submit(PortScanner.scan_host, h, ports)
+                in_flight[fut] = h
+
+            for _ in range(max_workers):
                 try:
-                    result = future.result()
-                    if result:
-                        ordered_results.append((host_order.get(host, 10**9), result))
-                except Exception as e:
-                    logger.error(f"Error during port scan for {host}: {e}")
+                    _submit(next(it))
+                except StopIteration:
+                    break
+
+            while in_flight:
+                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    host = in_flight.pop(fut)
+                    pbar.update(1)
+                    try:
+                        result = fut.result()
+                        if result:
+                            ordered_results.append((host_order.get(host, 10**9), result))
+                    except Exception as e:
+                        logger.error(f"Error during port scan for {host}: {e}")
+                    try:
+                        _submit(next(it))
+                    except StopIteration:
+                        pass
 
     ordered_results.sort(key=lambda x: x[0])
     hosts_to_capture = [r for _, r in ordered_results]
 
-    print("Port scan finished.")
+    dt = time.perf_counter() - t0
+    total_urls = sum(len(pl) for _, pl in hosts_to_capture)
+    hosts_found = len(hosts_to_capture)
+
+    port_counter: Counter = Counter()
+    for _, pl in hosts_to_capture:
+        for p, _ in pl:
+            port_counter[p] += 1
+
+    print(f"  Found {_c_bold(str(total_urls))} web server{'s' if total_urls != 1 else ''} "
+          f"on {hosts_found}/{len(hosts)} hosts  "
+          f"{_c_dim(_fmt_elapsed(dt))}")
+
+    if port_counter:
+        top = ", ".join(f"{p}({c})" for p, c in port_counter.most_common(6))
+        print(f"  Common: {top}")
+
+    with _DNS_FAILS_LOCK:
+        dns_fail_n = len(_DNS_FAILS)
+    if dns_fail_n:
+        print(f"  DNS failed: {_c_yellow(str(dns_fail_n))} host{'s' if dns_fail_n != 1 else ''}")
+
     return hosts_to_capture
+
+
+def _write_failed_list(output_file: str, failures: List[str]) -> None:
+    if not failures:
+        return
+    try:
+        p = Path(output_file)
+        out = p.with_suffix(p.suffix + ".failed.txt")
+        out.write_text("\n".join(failures) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def perform_screenshot_capture(
@@ -868,52 +1567,58 @@ def perform_screenshot_capture(
     output_file: str,
     follow_redirects: bool,
     timeout: int,
-    full_page: bool
-) -> None:
-    """Perform screenshot capture phase with improved error handling."""
-    # Calculate total screenshots
+    full_page: bool,
+    scan_meta: Optional[Dict] = None
+) -> Tuple[int, int, Counter]:
     total_screenshots = sum(len(port_list) for _, port_list in hosts_to_capture)
+    print(f"\n  Screenshot Capture ({total_screenshots} URLs, {timeout}s timeout)")
 
-    js_wait_time = min(max(timeout // 4, 3), 15)
-    redirect_text = " (following redirects)" if follow_redirects else ""
-    full_page_text = " with full-page capture" if full_page else ""
-    print(f"Beginning screen capture with {timeout}s page timeout, "
-          f"{js_wait_time}s JavaScript wait{redirect_text}{full_page_text}...")
+    captured, failed_count = 0, 0
+    tag_counter: Counter = Counter()
+    failures: List[str] = []
 
-    # Screenshot capture phase
-    driver = WebDriverManager.create_driver(timeout)
+    t0 = time.perf_counter()
     try:
         output_path = Path(output_file)
-        with tqdm(total=total_screenshots, unit='screenshot', desc="Screen capturing", leave=False) as pbar:
+        with tqdm(total=total_screenshots, unit='shot', desc="  Capturing", leave=False) as pbar:  # type: ignore[union-attr]
             if output_path.suffix.lower() == '.docx':
-                DocumentGenerator.generate_docx(
-                    driver, output_file, hosts_to_capture, pbar, follow_redirects, timeout, full_page
+                captured, failed_count, tag_counter, failures = DocumentGenerator.generate_docx(
+                    output_file, hosts_to_capture, pbar,
+                    follow_redirects, timeout, full_page, scan_meta
                 )
             else:
-                DocumentGenerator.generate_html(
-                    driver, output_file, hosts_to_capture, pbar, follow_redirects, timeout, full_page
+                captured, failed_count, tag_counter, failures = DocumentGenerator.generate_html(
+                    output_file, hosts_to_capture, pbar,
+                    follow_redirects, timeout, full_page, scan_meta
                 )
-
-        print("Screen capture finished.")
-
     finally:
-        WebDriverManager.cleanup_driver()
+        # Cleanup in the background so the user sees the summary instantly
+        WebDriverManager.cleanup_all()
 
+    dt = time.perf_counter() - t0
+    if failures:
+        _write_failed_list(output_file, failures)
+
+    fail_str = f"  ({_c_red(str(failed_count) + ' failed')})" if failed_count else ""
+    print(f"  Captured {_c_bold(str(captured))}/{total_screenshots} screenshots{fail_str}  {_c_dim(_fmt_elapsed(dt))}")
+
+    return captured, failed_count, tag_counter
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Argument validation
+# ═══════════════════════════════════════════════════════════════
 
 def validate_args(args: argparse.Namespace) -> None:
-    """Validate command line arguments."""
-    # Validate output file extension
     output_path = Path(args.output_file)
     if output_path.suffix.lower() not in ['.html', '.docx']:
         print("Error: Output file must have .html or .docx extension")
         sys.exit(1)
 
-    # Validate timeout
     if args.timeout <= 0:
         print("Error: Timeout must be positive")
         sys.exit(1)
 
-    # Check if output directory is writable
     output_dir = output_path.parent
     if not output_dir.exists():
         try:
@@ -927,8 +1632,11 @@ def validate_args(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════
+
 def main() -> None:
-    """Main execution function with improved error handling."""
     parser = argparse.ArgumentParser(
         description='Scan and capture web server screenshots.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -944,44 +1652,83 @@ Examples:
     parser.add_argument('input', help='Input hosts file, CIDR notation, or IP range / URL')
     parser.add_argument('output_file', help='Output file name (.docx or .html)')
     parser.add_argument('--timeout', '-t', type=int, default=DEFAULT_TIMEOUT,
-                       help=f'Page load timeout in seconds (default: {DEFAULT_TIMEOUT})')
+                        help=f'Page load timeout in seconds (default: {DEFAULT_TIMEOUT})')
     parser.add_argument('--redirect', '-r', action='store_true',
-                       help='Label final destination if page redirects (browser still follows redirects).')
+                        help='Label final destination if page redirects (browser still follows redirects).')
     parser.add_argument('--ports', '-p', type=comma_separated_ints, default=DEFAULT_PORTS,
-                       help='Comma-separated list of ports to scan (default: 80,443)')
+                        help='Comma-separated list of ports to scan (default: 80,443)')
     parser.add_argument('--full-page', action='store_true',
-                       help='Capture full-page screenshots (Firefox-only feature).')
+                        help='Capture full-page screenshots (Firefox-only feature).')
 
     args = parser.parse_args()
 
-    # Perform initial checks
-    initial_checks()
-
-    # Validate arguments
     validate_args(args)
+    initial_checks(args.output_file)
 
-    # Parse and expand hosts
     hosts = NetworkScanner.parse_hosts(args.input)
     if not hosts:
         print("No valid hosts found to scan.")
         sys.exit(1)
 
-    expanded_hosts = expand_hosts(hosts)
+    expanded_hosts = _dedupe_preserve_order(hosts)
     if not expanded_hosts:
         print("No hosts to scan after expansion.")
         sys.exit(1)
 
-    # Perform port scanning
+    port_str = ", ".join(map(str, args.ports))
+    redir_label = "label" if args.redirect else "off"
+    fp_label = "  Full-page: on" if args.full_page else ""
+
+    print(f"\n{'─' * 64}")
+    print(f"  NetGazer — Web Server Screenshot Scanner")
+    print(f"  Targets  : {len(expanded_hosts)} host{'s' if len(expanded_hosts) != 1 else ''}")
+    print(f"  Ports    : {port_str}")
+    print(f"  Output   : {args.output_file}")
+    print(f"  Timeout  : {args.timeout}s   Redirects: {redir_label}{fp_label}")
+    print(f"{'─' * 64}")
+
+    t_total = time.perf_counter()
+
+    print(f"\n  Port Scan")
     hosts_to_capture = perform_port_scan(expanded_hosts, args.ports)
 
     if not hosts_to_capture:
-        print("No web servers found on scanned hosts.")
+        total_dt = time.perf_counter() - t_total
+        print(f"\n  No web servers found on scanned hosts.")
+        print(f"  Tip: try --ports 8080,8443,9090 if non-standard ports are in use")
+        print(f"  Total: {_fmt_elapsed(total_dt)}")
+        print(f"{'─' * 64}")
         return
 
-    # Perform screenshot capture
-    perform_screenshot_capture(
-        hosts_to_capture, args.output_file, args.redirect, args.timeout, args.full_page
+    scan_meta = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_hosts": len(expanded_hosts),
+        "hosts_with_ports": len(hosts_to_capture),
+        "ports": args.ports,
+        "timeout": args.timeout,
+        "follow_redirects": args.redirect,
+    }
+
+    captured, failed_count, tag_counter = perform_screenshot_capture(
+        hosts_to_capture, args.output_file, args.redirect,
+        args.timeout, args.full_page, scan_meta
     )
+
+    total_dt = time.perf_counter() - t_total
+
+    print(f"\n{'─' * 64}")
+    print(f"  Saved: {_c_bold(args.output_file)} ({captured} screenshot{'s' if captured != 1 else ''})")
+
+    if tag_counter:
+        tag_parts = [f"{cnt}× {tag}" for tag, cnt in tag_counter.most_common()]
+        print(f"  Flagged: {', '.join(tag_parts)}")
+
+    if failed_count:
+        print(f"  Failed: {failed_count} capture{'s' if failed_count != 1 else ''}")
+        print(f"  Retry list: {Path(args.output_file).with_suffix(Path(args.output_file).suffix + '.failed.txt')}")
+
+    print(f"  Total: {_fmt_elapsed(total_dt)}")
+    print(f"{'─' * 64}")
 
 
 if __name__ == "__main__":
