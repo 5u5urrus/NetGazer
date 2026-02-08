@@ -478,57 +478,84 @@ class NetworkScanner:
 _TLS_CTX_LOCK = Lock()
 _TLS_CTX: Optional[ssl.SSLContext] = None
 
+# Fast-pass connect timeout: retry only “timeout-like” failures with full timeout.
+_CONNECT_FAST_TIMEOUT = 0.7
+
+# Remember which address family worked per host (speeds up dual-stack + improves accuracy)
+_FAMILY_PREF: Dict[str, int] = {}
+_FAMILY_PREF_LOCK = Lock()
+
+
+def _is_timeout_rc(rc: int) -> bool:
+    # Cross-platform-ish timeout codes. Windows commonly uses 10060.
+    return rc in {
+        getattr(errno, "ETIMEDOUT", 110),
+        110,
+        10060,  # WSAETIMEDOUT
+    }
+
 
 def _get_tls_ctx() -> ssl.SSLContext:
+    """Shared TLS context for quick HTTPS detection.
+    Clean output (no deprecated TLSv1 warnings) + reasonably tolerant handshakes."""
     global _TLS_CTX
     with _TLS_CTX_LOCK:
         if _TLS_CTX is not None:
             return _TLS_CTX
+
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+
+        # Tolerant without using deprecated TLSv1/TLSv1_1 minimums (keeps output clean).
+        # This helps avoid misclassifying some older-but-not-ancient HTTPS endpoints.
+        try:
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        except Exception:
+            pass
+
         _TLS_CTX = ctx
         return ctx
 
 
 class PortScanner:
     @staticmethod
-    def probe_port_with_addrs(host: str, port: int, addr_list: List[Tuple[int, tuple]], timeout: int = PORT_CHECK_TIMEOUT) -> Tuple[bool, str]:
+    def probe_port_with_addrs(
+        host: str,
+        port: int,
+        addr_list: List[Tuple[int, tuple]],
+        timeout: int = PORT_CHECK_TIMEOUT
+    ) -> Tuple[bool, str]:
         if not addr_list:
             return False, "http"
 
         sni_name = None if _is_ip_literal(host) else host
         tls_ctx = _get_tls_ctx()
 
-        for family, sockaddr0 in addr_list:
+        # Prefer the family that previously worked for this host (faster + fewer false misses).
+        with _FAMILY_PREF_LOCK:
+            pref = _FAMILY_PREF.get(host)
+        if pref in (socket.AF_INET, socket.AF_INET6):
+            addr_list = sorted(addr_list, key=lambda x: 0 if x[0] == pref else 1)
+
+        def _try_connect(
+            family: int,
+            sockaddr0: tuple,
+            conn_timeout: float
+        ) -> Tuple[int, Optional[socket.socket]]:
             sockaddr = _sockaddr_with_port(sockaddr0, port)
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(family, socket.SOCK_STREAM)
-                sock.settimeout(float(timeout))
+                sock.settimeout(conn_timeout)
                 rc = sock.connect_ex(sockaddr)
                 if rc != 0:
                     try:
                         sock.close()
                     except Exception:
                         pass
-                    continue
-
-                scheme = "http"
-                try:
-                    sock.settimeout(float(min(timeout, TLS_PROBE_TIMEOUT)))
-                    with tls_ctx.wrap_socket(sock, server_hostname=sni_name, do_handshake_on_connect=False) as ssock:
-                        ssock.settimeout(float(TLS_PROBE_TIMEOUT))
-                        ssock.do_handshake()
-                    scheme = "https"
-                except Exception:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-
-                return True, scheme
-
+                    return rc, None
+                return 0, sock
             except OSError as e:
                 try:
                     if sock:
@@ -537,7 +564,56 @@ class PortScanner:
                     pass
                 if getattr(e, "errno", None) in (errno.EMFILE, errno.ENOBUFS, errno.EADDRNOTAVAIL, errno.EADDRINUSE):
                     time.sleep(0.01)
-                continue
+                return int(getattr(e, "errno", 1) or 1), None
+
+        def _classify_tls(connected_sock: socket.socket) -> str:
+            """Connected TCP socket. Try TLS handshake; if it succeeds => https else http.
+            Always closes the underlying socket before returning."""
+            scheme = "http"
+            try:
+                connected_sock.settimeout(float(min(timeout, TLS_PROBE_TIMEOUT)))
+                ssock = tls_ctx.wrap_socket(
+                    connected_sock,
+                    server_hostname=sni_name,
+                    do_handshake_on_connect=False
+                )
+                try:
+                    ssock.settimeout(float(TLS_PROBE_TIMEOUT))
+                    ssock.do_handshake()
+                    scheme = "https"
+                finally:
+                    try:
+                        ssock.close()  # closes underlying socket too
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    connected_sock.close()
+                except Exception:
+                    pass
+            return scheme
+
+        # Pass 1: fast connect. Record timeout-like failures for retry.
+        timed_out: List[Tuple[int, tuple]] = []
+        fast_t = float(min(timeout, _CONNECT_FAST_TIMEOUT))
+
+        for family, sockaddr0 in addr_list:
+            rc, sock = _try_connect(family, sockaddr0, fast_t)
+            if rc == 0 and sock is not None:
+                with _FAMILY_PREF_LOCK:
+                    _FAMILY_PREF[host] = family
+                return True, _classify_tls(sock)
+            if _is_timeout_rc(rc):
+                timed_out.append((family, sockaddr0))
+
+        # Pass 2: only the ones that looked like “filtered/timeout”
+        full_t = float(timeout)
+        for family, sockaddr0 in timed_out:
+            rc, sock = _try_connect(family, sockaddr0, full_t)
+            if rc == 0 and sock is not None:
+                with _FAMILY_PREF_LOCK:
+                    _FAMILY_PREF[host] = family
+                return True, _classify_tls(sock)
 
         return False, "http"
 
