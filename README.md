@@ -23,6 +23,21 @@ While EyeWitness is an amazing tool with multitudes of features, NetGazer in som
     <li>NetGazer does not accumulate screenshots during capture, incorporating data directly into a single final docx or html files, hence presenting a cleaner job. EyeWitness creates a separate folder for all the images.</li>
 </ul>
 
+**Dependancy Requirements for pip (requirements.txt)**
+
+```
+python-docx
+docx
+selenium
+webdriver_manager
+```
+Make sure you’re using the right Python (3.x recommended)
+
+```
+python3 -m venv venv
+pip install -r requirements.txt
+```
+
 **Usage Examples**
 <ul>
     <li><code>python netgazer.py hosts.txt output.docx</code></li>
