@@ -1,0 +1,4 @@
+python-docx
+docx
+selenium
+webdriver_manager
